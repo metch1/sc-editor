@@ -1,0 +1,15 @@
+/.idea/
+/out/
+*.iml
+
+# Eclipse
+.settings
+.classpath
+.project
+
+screenshots/
+/target/
+
+# macOS Garbage file
+.DS_Store
+target/

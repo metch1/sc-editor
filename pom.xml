@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>dev.donutquine</groupId>
+    <artifactId>sc-editor</artifactId>
+    <version>${releaseVersion}</version>
+
+    <repositories>
+        <repository>
+            <id>github</id>
+            <url>https://maven.pkg.github.com/danila-schelkov/*</url>
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+        </repository>
+        <repository>
+            <id>jogamp</id>
+            <url>https://jogamp.org/deployment/maven/</url>
+        </repository>
+    </repositories>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <joglVersion>2.6.0</joglVersion>
+        <zstdJniVersion>1.5.7-8</zstdJniVersion>
+        <flatlafVersion>3.7.1</flatlafVersion>
+        <main.class>dev.donutquine.editor.Main</main.class>
+        <finalName>${project.artifactId}-${project.version}</finalName>
+        <releaseVersion>undefined</releaseVersion>
+    </properties>
+    <build>
+        <finalName>${finalName}</finalName>
+        <plugins>
+            <plugin>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.5.0</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <addClasspath>true</addClasspath>
+                            <classpathPrefix>libs/</classpathPrefix>
+                            <mainClass>${main.class}</mainClass>
+                        </manifest>
+                        <manifestEntries>
+                            <SC-Editor-Version>${releaseVersion}</SC-Editor-Version>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+            <plugin>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>copy-dependencies</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>copy-dependencies</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>
+                                ${project.build.directory}/libs
+                            </outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <configuration>
+                    <appendAssemblyId>false</appendAssemblyId>
+                    <finalName>
+                        ${project.artifactId}-${project.version}-${activatedProfile}
+                    </finalName>
+                    <archive>
+                        <manifest>
+                            <mainClass>${main.class}</mainClass>
+                        </manifest>
+                        <manifestEntries>
+                            <SC-Editor-Version>${releaseVersion}</SC-Editor-Version>
+                        </manifestEntries>
+                    </archive>
+                    <descriptorRefs>
+                        <descriptorRef>jar-with-dependencies</descriptorRef>
+                    </descriptorRefs>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+    <dependencies>
+        <dependency>
+            <groupId>org.jogamp.gluegen</groupId>
+            <artifactId>gluegen-rt</artifactId>
+            <version>${joglVersion}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.jogamp.jogl</groupId>
+            <artifactId>jogl-all</artifactId>
+            <version>${joglVersion}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.17</version>
+        </dependency>
+        <!-- TODO: make platform-dependent (not yet cuz assembly-plugin doesn't support archiving dll, etc.) -->
+        <dependency>
+            <groupId>com.formdev</groupId>
+            <artifactId>flatlaf</artifactId>
+            <version>${flatlafVersion}</version>
+            <!--            <classifier>no-natives</classifier>-->
+        </dependency>
+        <dependency>
+            <groupId>com.formdev</groupId>
+            <artifactId>flatlaf-extras</artifactId>
+            <version>${flatlafVersion}</version>
+            <!--            <classifier>no-natives</classifier>-->
+        </dependency>
+        <dependency>
+            <groupId>dev.donutquine</groupId>
+            <artifactId>sc-file</artifactId>
+            <version>1.0.3</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>com.github.luben</groupId>
+                    <artifactId>zstd-jni</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>dev.donutquine</groupId>
+            <artifactId>supercell-swf</artifactId>
+            <version>1.1.8</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>dev.donutquine</groupId>
+                    <artifactId>sc-file</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>dev.donutquine</groupId>
+            <artifactId>supercell-texture</artifactId>
+            <version>1.0.1</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>dev.donutquine</groupId>
+                    <artifactId>sc-file</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains</groupId>
+            <artifactId>annotations</artifactId>
+            <version>26.1.0</version>
+            <scope>compile</scope>
+        </dependency>
+    </dependencies>
+
+    <profiles>
+        <profile>
+            <id>windows</id>
+            <activation>
+                <os>
+                    <family>Windows</family>
+                    <arch>amd64</arch>
+                </os>
+                <property>
+                    <name>!skip.auto.profiles</name>
+                </property>
+            </activation>
+
+            <properties>
+                <activatedProfile>win64</activatedProfile>
+            </properties>
+
+            <dependencies>
+                <dependency>
+                    <groupId>org.jogamp.jogl</groupId>
+                    <artifactId>jogl-all</artifactId>
+                    <version>${joglVersion}</version>
+                    <classifier>natives-windows-amd64</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>org.jogamp.gluegen</groupId>
+                    <artifactId>gluegen-rt</artifactId>
+                    <version>${joglVersion}</version>
+                    <classifier>natives-windows-amd64</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>com.github.luben</groupId>
+                    <artifactId>zstd-jni</artifactId>
+                    <version>${zstdJniVersion}</version>
+                    <classifier>win_amd64</classifier>
+                </dependency>
+
+                <!--                <dependency>-->
+                <!--                    <groupId>com.formdev</groupId>-->
+                <!--                    <artifactId>flatlaf</artifactId>-->
+                <!--                    <version>${flatlafVersion}</version>-->
+                <!--                    <classifier>windows-x86_64</classifier>-->
+                <!--                    <type>dll</type>-->
+                <!--                </dependency>-->
+            </dependencies>
+        </profile>
+
+        <profile>
+            <id>linux</id>
+            <activation>
+                <os>
+                    <name>Linux</name>
+                </os>
+                <property>
+                    <name>!skip.auto.profiles</name>
+                </property>
+            </activation>
+
+            <properties>
+                <activatedProfile>linux</activatedProfile>
+            </properties>
+
+            <dependencies>
+                <dependency>
+                    <groupId>org.jogamp.jogl</groupId>
+                    <artifactId>jogl-all</artifactId>
+                    <version>${joglVersion}</version>
+                    <classifier>natives-linux-amd64</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>org.jogamp.gluegen</groupId>
+                    <artifactId>gluegen-rt</artifactId>
+                    <version>${joglVersion}</version>
+                    <classifier>natives-linux-amd64</classifier>
+                </dependency>
+
+                <dependency>
+                    <groupId>com.github.luben</groupId>
+                    <artifactId>zstd-jni</artifactId>
+                    <version>${zstdJniVersion}</version>
+                    <classifier>linux_amd64</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>com.github.luben</groupId>
+                    <artifactId>zstd-jni</artifactId>
+                    <version>${zstdJniVersion}</version>
+                    <classifier>linux_aarch64</classifier>
+                </dependency>
+
+                <!--                <dependency>-->
+                <!--                    <groupId>com.formdev</groupId>-->
+                <!--                    <artifactId>flatlaf</artifactId>-->
+                <!--                    <version>${flatlafVersion}</version>-->
+                <!--                    <classifier>linux-x86_64</classifier>-->
+                <!--                    <type>so</type>-->
+                <!--                </dependency>-->
+            </dependencies>
+        </profile>
+
+        <profile>
+            <id>macos</id>
+            <activation>
+                <os>
+                    <name>Mac OS X</name>
+                </os>
+                <property>
+                    <name>!skip.auto.profiles</name>
+                </property>
+            </activation>
+
+            <properties>
+                <activatedProfile>macos</activatedProfile>
+            </properties>
+
+            <dependencies>
+                <dependency>
+                    <groupId>org.jogamp.jogl</groupId>
+                    <artifactId>jogl-all</artifactId>
+                    <version>${joglVersion}</version>
+                    <classifier>natives-macosx-universal</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>org.jogamp.gluegen</groupId>
+                    <artifactId>gluegen-rt</artifactId>
+                    <version>${joglVersion}</version>
+                    <classifier>natives-macosx-universal</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>com.github.luben</groupId>
+                    <artifactId>zstd-jni</artifactId>
+                    <version>${zstdJniVersion}</version>
+                    <classifier>darwin_aarch64</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>com.github.luben</groupId>
+                    <artifactId>zstd-jni</artifactId>
+                    <version>${zstdJniVersion}</version>
+                    <classifier>darwin_x86_64</classifier>
+                </dependency>
+
+                <!--                <dependency>-->
+                <!--                    <groupId>com.formdev</groupId>-->
+                <!--                    <artifactId>flatlaf</artifactId>-->
+                <!--                    <version>${flatlafVersion}</version>-->
+                <!--                    <classifier>macos-arm64</classifier>-->
+                <!--                    <type>dylib</type>-->
+                <!--                </dependency>-->
+                <!--                <dependency>-->
+                <!--                    <groupId>com.formdev</groupId>-->
+                <!--                    <artifactId>flatlaf</artifactId>-->
+                <!--                    <version>${flatlafVersion}</version>-->
+                <!--                    <classifier>macos-x86_64</classifier>-->
+                <!--                    <type>dylib</type>-->
+                <!--                </dependency>-->
+            </dependencies>
+        </profile>
+    </profiles>
+</project>
