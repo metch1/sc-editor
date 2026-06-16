@@ -13,3 +13,10 @@ screenshots/
 # macOS Garbage file
 .DS_Store
 target/
+
+characters.sc
+old_sceditorJar.jar
+exports
+sc-editor-1.0.0-linux64.jar
+test.py
+text.txt

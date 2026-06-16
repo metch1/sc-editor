@@ -17,8 +17,6 @@ import dev.donutquine.editor.renderer.impl.gl.JoglContext;
 import dev.donutquine.editor.renderer.impl.texture.GLImage;
 import dev.donutquine.editor.renderer.impl.texture.khronos.ExtensionKhronosTextureLoader;
 import dev.donutquine.editor.renderer.impl.texture.khronos.KhronosTextureLoaders;
-import dev.donutquine.exporter.VideoFormat;
-import dev.donutquine.exporter.VideoFormats;
 import dev.donutquine.math.Rect;
 import dev.donutquine.math.ReadonlyRect;
 import dev.donutquine.renderer.impl.swf.objects.DisplayObject;
@@ -29,29 +27,23 @@ import dev.donutquine.swf.Matrix2x3;
 import dev.donutquine.swf.SupercellSWF;
 import dev.donutquine.swf.exceptions.UnableToFindObjectException;
 import dev.donutquine.swf.movieclips.MovieClipOriginal;
-import dev.donutquine.swf.movieclips.MovieClipState;
 import dev.donutquine.utilities.ImageUtils;
-import dev.donutquine.utilities.MovieClipHelper;
-import dev.donutquine.utilities.SystemUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.awt.image.BufferedImage;
-import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.stream.Stream;
 
 public final class CliExporter {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(CliExporter.class);
     private static final Path DEFAULT_OUTPUT_DIR = Path.of("exports").toAbsolutePath();
-    private static final VideoFormat DEFAULT_VIDEO_FORMAT = VideoFormats.WEBM;
 
     // Offscreen surface just needs to exist to create a GL context.
     // Actual render targets are FBO-backed and sized per-asset.
@@ -92,7 +84,8 @@ public final class CliExporter {
             return;
         }
 
-        if (parsed.exportName == null) {
+        // List mode: no --name and no --all
+        if (parsed.exportName == null && !parsed.exportAll) {
             listExportNames(swf);
             return;
         }
@@ -119,11 +112,13 @@ public final class CliExporter {
             }
 
             // Flush all queued texture upload tasks.
-            // stage.update() drains the ConcurrentLinkedQueue<Runnable> that
-            // GLImage.createWithFormat posted each texture into.
             flushRenderTasks();
 
-            exportAsset(assetFile, swf, parsed);
+            if (parsed.exportAll) {
+                exportAll(assetFile, swf, parsed);
+            } else {
+                exportNamed(assetFile, swf, parsed);
+            }
 
         } finally {
             offscreen.getContext().release();
@@ -132,12 +127,8 @@ public final class CliExporter {
     }
 
     // ── Flush the EditorStage render-thread task queue ────────────────────────
-    // Calls stage.update() which iterates and runs every pending Runnable.
-    // We call it twice: once right after asset load (texture uploads), and
-    // once after each render call (in case render itself posts more tasks).
     private static void flushRenderTasks() {
         EditorStage.getInstance().update();
-        // Ensure all GL commands are actually complete before we read pixels.
         gl3Global.glFinish();
     }
 
@@ -168,9 +159,73 @@ public final class CliExporter {
         return names;
     }
 
-    // ── Export mode ───────────────────────────────────────────────────────────
+    // ── --all export mode ─────────────────────────────────────────────────────
 
-    private static void exportAsset(SupercellSWFAssetFile assetFile,
+    private static void exportAll(SupercellSWFAssetFile assetFile,
+                                  SupercellSWF swf, CliArgs parsed) {
+        List<String> names = collectExportNames(swf);
+        if (names.isEmpty()) {
+            System.out.println("[cli] No exportable definitions found.");
+            return;
+        }
+
+        Path outDir;
+        try {
+            outDir = parsed.outputPath != null
+                    ? Path.of(parsed.outputPath)
+                    : DEFAULT_OUTPUT_DIR;
+            Files.createDirectories(outDir);
+        } catch (IOException e) {
+            System.err.println("[cli] Cannot create output directory: " + e.getMessage());
+            System.exit(6);
+            return;
+        }
+
+        System.out.println("[cli] Exporting " + names.size() + " assets...");
+        int ok = 0, skipped = 0;
+
+        for (String name : names) {
+            // Resolve name → id
+            int targetId = -1;
+            for (int id : swf.getMovieClipIds()) {
+                try {
+                    MovieClipOriginal mc = swf.getOriginalMovieClip(id & 0xFFFF, null);
+                    if (name.equals(mc.getExportName())) {
+                        targetId = id & 0xFFFF;
+                        break;
+                    }
+                } catch (UnableToFindObjectException e) {
+                    LOGGER.warn("Could not check MovieClip id={}", id, e);
+                }
+            }
+            if (targetId == -1) { skipped++; continue; }
+
+            DisplayObject displayObject;
+            try {
+                displayObject = assetFile.getOrCreate(targetId, name);
+            } catch (UnableToFindObjectException e) {
+                LOGGER.warn("Could not instantiate {}: {}", name, e.getMessage());
+                skipped++;
+                continue;
+            }
+
+            if (displayObject.isTextField()) { skipped++; continue; }
+
+            Path outputPath = outDir.resolve(name + ".png");
+            EditorStage stage = EditorStage.getInstance();
+
+            // --firstframe: always export frame 0 as PNG regardless of frame count
+            exportFirstFrame(displayObject, outputPath, stage);
+            System.out.println("[cli]   " + name + ".png");
+            ok++;
+        }
+
+        System.out.println("[cli] Done. Exported: " + ok + "  skipped: " + skipped);
+    }
+
+    // ── Single named export mode ───────────────────────────────────────────────
+
+    private static void exportNamed(SupercellSWFAssetFile assetFile,
                                     SupercellSWF swf, CliArgs parsed) {
         // Resolve export name → object ID
         int targetId = -1;
@@ -209,20 +264,14 @@ public final class CliExporter {
             return;
         }
 
-        boolean isAnimated = displayObject.isMovieClip()
-                && ((MovieClip) displayObject).getFrameCountRecursive() > 1;
-
-        // Resolve output path
+        // Resolve output path — always PNG (first frame only)
         Path outputPath;
         try {
             if (parsed.outputPath != null) {
                 outputPath = Path.of(parsed.outputPath);
             } else {
                 Files.createDirectories(DEFAULT_OUTPUT_DIR);
-                String ext = isAnimated
-                        ? resolveVideoFormat(parsed.formatName).name()
-                        : "png";
-                outputPath = DEFAULT_OUTPUT_DIR.resolve(parsed.exportName + "." + ext);
+                outputPath = DEFAULT_OUTPUT_DIR.resolve(parsed.exportName + ".png");
             }
             if (outputPath.getParent() != null) {
                 Files.createDirectories(outputPath.getParent());
@@ -234,31 +283,113 @@ public final class CliExporter {
         }
 
         EditorStage stage = EditorStage.getInstance();
-
-        if (isAnimated) {
-            exportVideo((MovieClip) displayObject, outputPath,
-                    resolveVideoFormat(parsed.formatName), stage);
-        } else {
-            exportImage(displayObject, outputPath, stage);
-        }
+        exportFirstFrame(displayObject, outputPath, stage);
     }
 
-    // ── Image export ── exact mirror of DisplayObjectContextMenu.exportAsImage ─
+    // ── First-frame image export ──────────────────────────────────────────────
+    //
+    // WHY TRANSPARENT PIXELS MATTER
+    // ──────────────────────────────
+    // SC assets live in a shared coordinate space.  The world origin (0,0) is the
+    // registration/anchor point every asset is positioned from at runtime.
+    // If you export only the tight pixel bounding box of the visible geometry, you
+    // lose that anchor: the consumer has no way to know where (0,0) sat inside the
+    // image, so sprites composited together will misalign.
+    //
+    // The correct canvas is symmetric around (0,0):
+    //
+    //   canvas_left   = -max(|left|,  |right|)
+    //   canvas_right  =  max(|left|,  |right|)
+    //   canvas_top    = -max(|top|,   |bottom|)
+    //   canvas_bottom =  max(|top|,   |bottom|)
+    //
+    // This is exactly what DisplayObjectContextMenu.getRenderBounds() does in the GUI.
+    // The resulting canvas is always centred on (0,0), and world origin pixel coords
+    // are always (width/2, height/2) — predictable, no metadata needed.
+    //
+    // The extra space around the tight geometry is left as transparent (alpha=0),
+    // which PNG handles fine.
+    //
+    // HOW THE CAMERA + FBO INTERACT
+    // ──────────────────────────────
+    // prepareStageForRendering(stage, canvasRect):
+    //   1. camera.init(canvas.width, canvas.height)
+    //      → viewport = [-w/2, -h/2, w/2, h/2]  (centred at origin)
+    //   2. camera.moveToFit(canvasRect)
+    //      → offsetX = canvasRect.midX - 0 = 0   (symmetric canvas midX IS 0)
+    //      → offsetY = canvasRect.midY - 0 = 0
+    //   3. updateClipArea() → clipArea = viewport (no pan needed)
+    //   4. glOrthof(left, right, bottom, top, -1, 1)  [Y-up clip space]
+    //
+    // Result: a vertex at world (0,0) maps to the exact centre of the FBO.
+    // getPixelArray(true) flips Y (GL bottom-left → image top-left).
+    // So in the saved PNG, world (0,0) = pixel (width/2, height/2).  ✓
+    //
+    // BOUNDS FIX SUMMARY
+    // ───────────────────
+    // Old code problem 1: calculateBoundsForAllFrames called getDisplayObjectBounds
+    //   internally, which re-ran render(deltaTime=0).  deltaTime=0 skips MovieClip
+    //   frame advancement, so child clips were frozen in whatever position the loop
+    //   left them — stale, wrong bounds per frame.
+    // Old code problem 2: tight bounds were passed directly to prepareStageForRendering,
+    //   discarding the transparent border around the world origin.
+    // Old code problem 3: for single-frame objects, calculateBoundsForAllFrames went
+    //   through the full multi-frame loop path unnecessarily.
+    //
+    // All three are fixed here.
+    //
+    private static void exportFirstFrame(DisplayObject displayObject,
+                                         Path outputPath, EditorStage stage) {
 
-    private static void exportImage(DisplayObject displayObject,
-                                    Path outputPath, EditorStage stage) {
-        final float pixelSize = 1.0f;
+        // ── Step 1: pin the clip at frame 0 ──────────────────────────────────
+        // Do this BEFORE measuring bounds so the dry-run render and the real render
+        // both see the identical frame.  gotoAbsoluteTimeRecursive(0) recurses into
+        // all nested child MovieClips too, so every level is at its t=0 state.
+        if (displayObject.isMovieClip()) {
+            MovieClip mc = (MovieClip) displayObject;
+            mc.gotoAbsoluteTimeRecursive(0);
+            mc.gotoAndStopFrameIndex(0);
+        }
 
-        // calculateBoundsForAllFrames drives render() in bounds-calculation mode
-        // which does NOT require a real FBO — safe to call before prepareStageForRendering
-        Rect bounds = stage.calculateBoundsForAllFrames(displayObject);
-        bounds.scale(pixelSize);
+        // ── Step 2: measure tight geometry bounds in world space ──────────────
+        // getDisplayObjectBounds() sets isCalculatingBounds=true and calls
+        // displayObject.render(IDENTITY, ..., deltaTime=0).  With deltaTime=0
+        // MovieClip.render skips frame advancement and goes straight to super.render,
+        // so the clip stays at frame 0 as we set above.  Every Shape encountered
+        // calls stage.startShape(rect, ...) which merges rect into this.bounds.
+        Rect tightBounds = stage.getDisplayObjectBounds(displayObject);
 
-        Matrix2x3 matrix = new Matrix2x3();
-        matrix.scaleMultiply(pixelSize, pixelSize);
+        if (!areBoundsValid(tightBounds)) {
+            LOGGER.warn("Empty bounds for {}, using 1x1 fallback", outputPath.getFileName());
+            tightBounds = new Rect(0, 0, 1, 1);
+        }
 
-        Framebuffer framebuffer = RendererHelper.prepareStageForRendering(
-                stage, roundBounds(bounds, false));
+        // ── Step 3: expand to origin-symmetric canvas ─────────────────────────
+        // This preserves the transparent space between the geometry and the world
+        // origin (0,0).  The canvas is always centred on (0,0), so any two exports
+        // from the same SC file can be composited by simply overlaying the PNGs —
+        // their origins are aligned by construction.
+        //
+        // Example: tight bounds = (-10, -5, 80, 60)
+        //   maxH = max(|-10|, |80|) = 80  → canvas X: -80..80  (160 px wide)
+        //   maxV = max(|-5|,  |60|) = 60  → canvas Y: -60..60  (120 px tall)
+        //   world (0,0) is at pixel (80, 60) in the saved PNG.
+        //
+        float maxH = Math.max(Math.abs(tightBounds.getLeft()),  Math.abs(tightBounds.getRight()));
+        float maxV = Math.max(Math.abs(tightBounds.getTop()),   Math.abs(tightBounds.getBottom()));
+        // Guard: if geometry sits entirely on one side (e.g. left=5, right=80)
+        // maxH=80 already covers the origin gap.  No special case needed.
+
+        // ── Step 4: round canvas outward to integer pixels ────────────────────
+        // Using the symmetric canvas means width = 2*ceil(maxH), height = 2*ceil(maxV).
+        // We round maxH/maxV up before doubling so the canvas stays symmetric.
+        ReadonlyRect fboRect = roundSymmetric(maxH, maxV);
+
+        // ── Step 5: configure camera + allocate FBO ───────────────────────────
+        // Because the canvas is symmetric (midX=0, midY=0), moveToFit sets
+        // camera offset to (0,0) — no pan.  The viewport exactly covers world space
+        // [-fboW/2 .. fboW/2] × [-fboH/2 .. fboH/2].
+        Framebuffer framebuffer = RendererHelper.prepareStageForRendering(stage, fboRect);
 
         boolean parentSet = false;
         if (displayObject.getParent() == null) {
@@ -266,21 +397,23 @@ public final class CliExporter {
             parentSet = true;
         }
 
-        // render() queues geometry into the BatchedRenderer
-        displayObject.render(matrix, new ColorTransform(), 0, 0);
+        // ── Step 6: render (deltaTime=0 keeps clip at frame 0) ───────────────
+        Matrix2x3 identity = new Matrix2x3();
+        displayObject.render(identity, new ColorTransform(), 0, 0);
 
-        // renderToFramebuffer() flushes (endRendering) the batched geometry
-        // into the FBO with a transparent (0,0,0,0) clear — exactly what the GUI does
+        // ── Step 7: flush geometry into FBO ──────────────────────────────────
+        // renderToFramebuffer clears to (0,0,0,0), then endRendering flushes the
+        // BatchedRenderer draw calls into the bound FBO.
         stage.renderToFramebuffer(framebuffer);
 
-        // Flush any post-render tasks and wait for GPU completion
+        // ── Step 8: GPU sync ──────────────────────────────────────────────────
         flushRenderTasks();
 
         if (parentSet) displayObject.setParent(null);
 
-        // getPixelArray(true) reads GL_RGBA bytes, views them as ints, then flips Y.
-        // The result is PREMULTIPLIED RGBA in the format the RGBA_MODEL expects.
-        // We un-premultiply before saving so PNG viewers get correct straight alpha.
+        // ── Step 9: read pixels, un-premultiply, save ─────────────────────────
+        // getPixelArray(true) reads GL_RGBA bytes and flips Y.
+        // Pixels are premultiplied (shader writes rgb*a), so we divide back.
         int[] pixels = framebuffer.getPixelArray(true);
         unPremultiplyAlpha(pixels);
 
@@ -289,73 +422,9 @@ public final class CliExporter {
         framebuffer.delete();
 
         ImageUtils.saveImage(outputPath, image);
-        System.out.println("[cli] Image saved: " + outputPath.toAbsolutePath());
-    }
-
-    // ── Video export ── exact mirror of DisplayObjectContextMenu.exportAsVideo ─
-
-    private static void exportVideo(MovieClip movieClip, Path outputPath,
-                                    VideoFormat format, EditorStage stage) {
-        final float pixelSize = 1.0f;
-
-        Rect bounds = stage.calculateBoundsForAllFrames(movieClip);
-        bounds.scale(pixelSize);
-
-        ReadonlyRect ceilBounds = roundBounds(bounds, format.requiresSizeDividableByTwo());
-
-        Matrix2x3 matrix = new Matrix2x3();
-        matrix.scaleMultiply(pixelSize, pixelSize);
-        ColorTransform colorTransform = new ColorTransform();
-
-        MovieClipState state  = movieClip.getState();
-        int loopFrame  = movieClip.getLoopFrame();
-        int startFrame = movieClip.getCurrentFrame();
-        int fps        = movieClip.getFps();
-
-        Framebuffer framebuffer = RendererHelper.prepareStageForRendering(stage, ceilBounds);
-
-        boolean parentSet = false;
-        if (movieClip.getParent() == null) {
-            movieClip.setParent(stage.getStageSprite());
-            parentSet = true;
-        }
-
-        Path framesDir = outputPath.getParent().resolve(
-                outputPath.getFileName().toString() + "_frames");
-        framesDir.toFile().mkdirs();
-
-        MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
-            movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
-            if (loopFrame != -1) {
-                movieClip.setFrame(loopFrame);
-            } else if (state == MovieClipState.STOPPED) {
-                movieClip.setFrame(startFrame);
-            }
-
-            // Queue geometry
-            movieClip.render(matrix, colorTransform, 0, 0);
-
-            // Flush geometry into FBO
-            stage.renderToFramebuffer(framebuffer);
-
-            // Flush pending GL tasks + GPU sync
-            flushRenderTasks();
-
-            int[] pixels = framebuffer.getPixelArray(true);
-            unPremultiplyAlpha(pixels);
-
-            BufferedImage image = ImageUtils.createBufferedImageFromPixels(
-                    framebuffer.getWidth(), framebuffer.getHeight(), pixels, false);
-
-            ImageUtils.saveImage(framesDir.resolve(frameIndex + ".png"), image);
-        });
-
-        if (parentSet) movieClip.setParent(null);
-        framebuffer.delete();
-
-        // Blocking ffmpeg — no SwingWorker needed in CLI mode
-        runFfmpegBlocking(framesDir, outputPath, format, fps);
-        System.out.println("[cli] Video saved: " + outputPath.toAbsolutePath());
+        System.out.println("[cli] Image saved: " + outputPath.toAbsolutePath()
+                + "  (" + framebuffer.getWidth() + "x" + framebuffer.getHeight()
+                + ", origin at " + framebuffer.getWidth() / 2 + "," + framebuffer.getHeight() / 2 + ")");
     }
 
     // ── Un-premultiply alpha ───────────────────────────────────────────────────
@@ -371,11 +440,10 @@ public final class CliExporter {
             int p = pixels[i];
             int a = (p >> 24) & 0xFF;
             if (a == 0)   { pixels[i] = 0; continue; }
-            if (a == 255) continue; // fully opaque — nothing to do
+            if (a == 255) continue;
             int r = (p       ) & 0xFF;
             int g = (p >>  8) & 0xFF;
             int b = (p >> 16) & 0xFF;
-            // Divide premultiplied components back by alpha
             r = Math.min(255, (r * 255) / a);
             g = Math.min(255, (g * 255) / a);
             b = Math.min(255, (b * 255) / a);
@@ -383,42 +451,42 @@ public final class CliExporter {
         }
     }
 
-    // ── Blocking ffmpeg ───────────────────────────────────────────────────────
+    // ── Geometry helpers ──────────────────────────────────────────────────────
 
-    private static void runFfmpegBlocking(Path framesDir, Path outputPath,
-                                          VideoFormat format, int fps) {
-        try {
-            Process process = SystemUtils.runProcess(
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "panic",
-                    "-framerate", fps,
-                    "-i", framesDir.resolve("%d.png").toAbsolutePath(),
-                    "-c:v", format.codec(),
-                    "-pix_fmt", format.pixelFormat(),
-                    "-lossless", 1,
-                    outputPath.toAbsolutePath()
-            );
+    // Returns false if the Rect was never expanded from its infinite-sentinel
+    // initial state, meaning no geometry was found (invisible / empty clip).
+    private static boolean areBoundsValid(Rect bounds) {
+        return bounds.getLeft() != Float.POSITIVE_INFINITY
+                && bounds.getRight() != Float.NEGATIVE_INFINITY
+                && bounds.getTop() != Float.POSITIVE_INFINITY
+                && bounds.getBottom() != Float.NEGATIVE_INFINITY
+                && bounds.getWidth() > 0
+                && bounds.getHeight() > 0;
+    }
 
-            LOGGER.info("Waiting for ffmpeg...");
-            int exitCode = process.waitFor();
+    // Round a symmetric canvas: ceil each half-extent, then double.
+    // Keeps the canvas perfectly symmetric so world (0,0) lands exactly at the
+    // centre pixel.  e.g. maxH=80.3f → halfW=81 → canvas -81..81 (162 px wide).
+    private static ReadonlyRect roundSymmetric(float maxH, float maxV) {
+        int halfW = (int) Math.ceil(maxH);
+        int halfH = (int) Math.ceil(maxV);
+        if (halfW < 1) halfW = 1;
+        if (halfH < 1) halfH = 1;
+        return new Rect(-halfW, -halfH, halfW, halfH);
+    }
 
-            if (exitCode != 0) {
-                String err = new String(process.getErrorStream().readAllBytes());
-                if (!err.isEmpty()) LOGGER.error("ffmpeg stderr: {}", err);
-                System.err.println("[cli] ffmpeg exited with code " + exitCode);
-            } else {
-                try (Stream<Path> files = Files.walk(framesDir)) {
-                    files.sorted(Comparator.reverseOrder())
-                         .map(Path::toFile)
-                         .forEach(File::delete);
-                }
-            }
-        } catch (IOException | InterruptedException e) {
-            System.err.println("[cli] ffmpeg error: " + e.getMessage());
-            LOGGER.error("ffmpeg invocation failed", e);
+    // Round bounds outward to integer pixels (kept for potential future use).
+    @SuppressWarnings("unused")
+    private static ReadonlyRect roundBounds(Rect bounds, boolean requiresDivisibleByTwo) {
+        int left   = (int) Math.floor(bounds.getLeft());
+        int right  = (int) Math.ceil(bounds.getRight());
+        int top    = (int) Math.floor(bounds.getTop());
+        int bottom = (int) Math.ceil(bounds.getBottom());
+        if (requiresDivisibleByTwo) {
+            if ((right  - left) % 2 != 0) right++;
+            if ((bottom - top)  % 2 != 0) bottom++;
         }
+        return new Rect(left, top, right, bottom);
     }
 
     // ── GL bootstrap ──────────────────────────────────────────────────────────
@@ -428,13 +496,11 @@ public final class CliExporter {
         GLCapabilities caps = new GLCapabilities(profile);
         caps.setOnscreen(false);
         caps.setDoubleBuffered(false);
-        // Request stencil buffer — required for EditorStage stencil mask rendering
         caps.setStencilBits(8);
 
         GLDrawableFactory factory = GLDrawableFactory.getFactory(profile);
         GLOffscreenAutoDrawable drawable = factory.createOffscreenAutoDrawable(
                 null, caps, null, OFFSCREEN_W, OFFSCREEN_H);
-        // This call creates the native surface and makes the context current temporarily.
         drawable.display();
         return drawable;
     }
@@ -442,7 +508,6 @@ public final class CliExporter {
     private static void initEditorStage(GL3 gl3) {
         JoglContext ctx = new JoglContext(gl3);
 
-        // Mirror EventListener.init() exactly
         ExtensionKhronosTextureLoader extLoader = new ExtensionKhronosTextureLoader(ctx);
         KhronosTextureLoaders.registerLoader(extLoader);
         GLImage.khronosTextureLoader = KhronosTextureLoaders.getLoader();
@@ -461,57 +526,38 @@ public final class CliExporter {
         }
     }
 
-    // ── Geometry helpers ──────────────────────────────────────────────────────
-
-    private static ReadonlyRect roundBounds(Rect bounds, boolean requiresDivisibleByTwo) {
-        int left   = (int) Math.floor(bounds.getLeft());
-        int right  = (int) Math.ceil(bounds.getRight());
-        int top    = (int) Math.floor(bounds.getTop());
-        int bottom = (int) Math.ceil(bounds.getBottom());
-        if (requiresDivisibleByTwo) {
-            if ((right  - left) % 2 != 0) right++;
-            if ((bottom - top)  % 2 != 0) bottom++;
-        }
-        return new Rect(left, top, right, bottom);
-    }
-
-    private static VideoFormat resolveVideoFormat(String name) {
-        if (name == null) return DEFAULT_VIDEO_FORMAT;
-        VideoFormat fmt = VideoFormats.getVideoFormatByName(name);
-        if (fmt == null) {
-            System.err.println("[cli] Unknown format \"" + name
-                    + "\", falling back to " + DEFAULT_VIDEO_FORMAT.name());
-            return DEFAULT_VIDEO_FORMAT;
-        }
-        return fmt;
-    }
-
     // ── CLI argument model ────────────────────────────────────────────────────
 
     static final class CliArgs {
         final String scFile;
-        final String exportName;
-        final String formatName;
+        final String exportName;   // null when listing or --all
+        final boolean exportAll;   // true when --all is present
+        final boolean firstFrame;  // true when --firstframe is present (always for PNG now)
         final String outputPath;
 
         private CliArgs(String scFile, String exportName,
-                        String formatName, String outputPath) {
-            this.scFile = scFile;
-            this.exportName = exportName;
-            this.formatName = formatName;
-            this.outputPath = outputPath;
+                        boolean exportAll, boolean firstFrame, String outputPath) {
+            this.scFile      = scFile;
+            this.exportName  = exportName;
+            this.exportAll   = exportAll;
+            this.firstFrame  = firstFrame;
+            this.outputPath  = outputPath;
         }
 
         static CliArgs parse(String[] args) {
-            String scFile = null, exportName = null,
-                   formatName = null, outputPath = null;
+            String  scFile     = null;
+            String  exportName = null;
+            String  outputPath = null;
+            boolean exportAll  = false;
+            boolean firstFrame = false;
 
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
-                    case "--export" -> { if (i + 1 < args.length) scFile     = args[++i]; }
-                    case "--name"   -> { if (i + 1 < args.length) exportName = args[++i]; }
-                    case "--format" -> { if (i + 1 < args.length) formatName = args[++i]; }
-                    case "--out"    -> { if (i + 1 < args.length) outputPath = args[++i]; }
+                    case "--export"     -> { if (i + 1 < args.length) scFile     = args[++i]; }
+                    case "--name"       -> { if (i + 1 < args.length) exportName = args[++i]; }
+                    case "--out"        -> { if (i + 1 < args.length) outputPath = args[++i]; }
+                    case "--all"        -> exportAll  = true;
+                    case "--firstframe" -> firstFrame = true;
                     default -> LOGGER.debug("Ignoring unknown flag: {}", args[i]);
                 }
             }
@@ -519,14 +565,22 @@ public final class CliExporter {
             if (scFile == null) {
                 System.err.println("[cli] --export <file.sc> is required");
                 System.err.println("[cli] Usage:");
-                System.err.println("  --export <file.sc>                    list names");
-                System.err.println("  --export <file.sc> --name <name>      export asset");
-                System.err.println("  --export <file.sc> --name <n> --format webm|mp4|hevc|avi");
-                System.err.println("  --export <file.sc> --name <n> --out <path>");
+                System.err.println("  --export <file.sc>                             list names");
+                System.err.println("  --export <file.sc> --name <name>               export first frame as PNG");
+                System.err.println("  --export <file.sc> --name <name> --out <path>  export to specific path");
+                System.err.println("  --export <file.sc> --all --firstframe           export all as PNG (first frame)");
+                System.err.println("  --export <file.sc> --all --firstframe --out <dir>  export all into dir");
                 System.exit(1);
             }
 
-            return new CliArgs(scFile, exportName, formatName, outputPath);
+            // --all without --firstframe: warn and treat as first-frame anyway
+            // (video export removed from CLI; use the GUI for that)
+            if (exportAll && !firstFrame) {
+                System.err.println("[cli] Warning: --all implies first-frame PNG export. " +
+                        "Use --firstframe to silence this warning.");
+            }
+
+            return new CliArgs(scFile, exportName, exportAll, firstFrame, outputPath);
         }
     }
 }

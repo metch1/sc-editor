@@ -5,6 +5,9 @@ import dev.donutquine.editor.renderer.Renderbuffer;
 import dev.donutquine.editor.renderer.gl.texture.GLTexture;
 import dev.donutquine.editor.renderer.texture.RenderableTexture;
 
+/**
+ * Fixed version with proper texture filtering configuration
+ */
 public class GLFramebuffer extends Framebuffer {
     protected final RenderableTexture texture, stencilTexture;
     protected final Renderbuffer renderbuffer;
@@ -23,41 +26,54 @@ public class GLFramebuffer extends Framebuffer {
 
         this.bind();
 
+        // Create and configure color texture
         GLTexture texture = new GLTexture(gl, this.width, this.height);
         texture.bindContext();
         texture.bind();
         texture.init(0, GLConstants.GL_RGBA, GLConstants.GL_RGBA, GLConstants.GL_UNSIGNED_BYTE, null);
+        // FIX: Generate mipmaps for better quality at all zoom levels
+        texture.generateMipMap();
         this.attachTexture(texture, GLConstants.GL_COLOR_ATTACHMENT0);
 
         this.texture = texture;
 
+        // Create and configure stencil texture
         GLTexture stencilTexture = new GLTexture(gl, this.width, this.height);
         stencilTexture.bindContext();
         stencilTexture.bind();
-        stencilTexture.init(0, GLConstants.GL_DEPTH24_STENCIL8, GLConstants.GL_DEPTH_STENCIL, GLConstants.GL_UNSIGNED_INT_24_8, null);
-//        stencilTexture.setFilters(GLConstants.GL_NEAREST, GLConstants.GL_NEAREST);
+        stencilTexture.init(0, GLConstants.GL_DEPTH24_STENCIL8, GLConstants.GL_DEPTH_STENCIL,
+                GLConstants.GL_UNSIGNED_INT_24_8, null);
+
+        // FIX: Properly configure stencil texture with GL_NEAREST
+        // Depth/Stencil textures should NOT use linear filtering
+        stencilTexture.setFilters(GLConstants.GL_NEAREST, GLConstants.GL_NEAREST);
+
         this.attachTexture(stencilTexture, GLConstants.GL_DEPTH_STENCIL_ATTACHMENT);
 
         this.stencilTexture = stencilTexture;
 
-        // Note: it broke the framebuffer rendering, so I've commented it out
+        // Note: Renderbuffer commented out due to framebuffer compatibility issues
         // this.renderbuffer = new JoglRenderbuffer(this.gl, this.width, this.height);
-        // this.attachRenderbuffer(renderbuffer, GLConstants.GL_STENTIC_ATTACHMENT);
+        // this.attachRenderbuffer(renderbuffer, GLConstants.GL_STENCIL_ATTACHMENT);
         this.renderbuffer = null;
 
-        assert this.gl.glCheckFramebufferStatus(GLConstants.GL_FRAMEBUFFER) == GLConstants.GL_FRAMEBUFFER_COMPLETE : "Framebuffer is not complete";
+        assert this.gl.glCheckFramebufferStatus(GLConstants.GL_FRAMEBUFFER) == GLConstants.GL_FRAMEBUFFER_COMPLETE
+                : "Framebuffer is not complete";
 
         this.unbind();
     }
 
     @Override
-    protected void attachRenderbuffer(Renderbuffer renderbuffer, @SuppressWarnings("SameParameterValue") int attachmentType) {
-        this.gl.glFramebufferRenderbuffer(GLConstants.GL_FRAMEBUFFER, attachmentType, GLConstants.GL_RENDERBUFFER, renderbuffer.getId());
+    protected void attachRenderbuffer(Renderbuffer renderbuffer,
+            @SuppressWarnings("SameParameterValue") int attachmentType) {
+        this.gl.glFramebufferRenderbuffer(GLConstants.GL_FRAMEBUFFER, attachmentType, GLConstants.GL_RENDERBUFFER,
+                renderbuffer.getId());
     }
 
     @Override
     protected void attachTexture(RenderableTexture texture, int attachmentType) {
-        this.gl.glFramebufferTexture2D(GLConstants.GL_FRAMEBUFFER, attachmentType, GLConstants.GL_TEXTURE_2D, texture.getId(), 0);
+        this.gl.glFramebufferTexture2D(GLConstants.GL_FRAMEBUFFER, attachmentType, GLConstants.GL_TEXTURE_2D,
+                texture.getId(), 0);
     }
 
     @Override
@@ -80,7 +96,8 @@ public class GLFramebuffer extends Framebuffer {
     @Override
     public void delete() {
         this.gl.glDeleteFramebuffer(this.id);
-        if (this.renderbuffer != null) this.renderbuffer.delete();
+        if (this.renderbuffer != null)
+            this.renderbuffer.delete();
         this.texture.delete();
         this.stencilTexture.delete();
     }
