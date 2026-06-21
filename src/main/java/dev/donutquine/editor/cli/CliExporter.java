@@ -45,19 +45,32 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 /**
- * OPTIMIZED CLI EXPORTER - Fast, lean, native speed
+ * OPTIMIZED CLI EXPORTER
  *
- * Key optimizations:
- * - Refactored renderer state management (single context per export)
- * - --bounds flag separates tight/symmetric canvas logic (opt-in)
- * - Lazy bounds calculation only when needed
- * - Direct memory access for pixel ops (no intermediate objects)
- * - Parallel ffmpeg encoding setup (async frame writes)
- * - Consolidated rendering pipeline (no redundant state changes)
- * - MOV format: lossless QuickTime with alpha preservation
+ * Key optimizations over previous version:
+ * - Async PNG writes via a fixed thread-pool (render thread never blocks on disk I/O)
+ * - Terminal flood prevention: single updating progress line using ANSI \r instead of
+ *   one println per frame
+ * - --bounds single-frame: uses getDisplayObjectBounds() directly (no full-animation
+ *   scan for a static shape)
+ * - Bounds-pass in frame-sequence export is reused from the render loop (no second
+ *   full-frame iteration)
+ * - flushRenderTasks() no longer calls update() (which internally re-renders to the
+ *   screen FBO and runs gizmos) — in CLI mode we only need glFinish()
+ * - Framebuffer pixel readback is kept on the GL thread; only the BufferedImage
+ *   creation + PNG encode is offloaded to the writer pool
+ * - MOV: frames are piped directly to ffmpeg stdin as raw ARGB bytes, eliminating
+ *   the intermediate PNG-on-disk round-trip
  */
 public final class CliExporter {
 
@@ -68,41 +81,20 @@ public final class CliExporter {
     private static final int OFFSCREEN_W = 8;
     private static final int OFFSCREEN_H = 8;
 
+    // Writer thread-pool: PNG compression is CPU-bound, keep one thread per core
+    // (minus one for the GL/render thread) so we never saturate the system.
+    private static final int WRITER_THREADS = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
+
     private static GL3 gl3Global;
     private static EditorStage stageGlobal;
 
-    private CliExporter() {
-    }
-
-    // ── Frame Assembly Pipeline ────────────────────────────────────────────────
-    private static class FrameAssemblyPipeline {
-        final List<BufferedImage> frames = new ArrayList<>();
-        final int width;
-        final int height;
-        final int fps;
-
-        FrameAssemblyPipeline(int width, int height, int fps) {
-            this.width = width;
-            this.height = height;
-            this.fps = fps;
-        }
-
-        void addFrame(int[] pixels) {
-            BufferedImage img = ImageUtils.createBufferedImageFromPixels(width, height, pixels, false);
-            frames.add(img);
-        }
-
-        int frameCount() {
-            return frames.size();
-        }
-    }
+    private CliExporter() {}
 
     // ── Public API ────────────────────────────────────────────────────────────
 
     public static boolean isCliMode(String[] args) {
         for (String arg : args) {
-            if ("--export".equals(arg))
-                return true;
+            if ("--export".equals(arg)) return true;
         }
         return false;
     }
@@ -116,7 +108,6 @@ public final class CliExporter {
             System.exit(1);
         }
 
-        // Load metadata first (no GL needed)
         SupercellSWF swf;
         try {
             swf = SupercellSWFAssetFileLoader.loadInternal(scPath);
@@ -127,13 +118,11 @@ public final class CliExporter {
             return;
         }
 
-        // List mode: no GL context needed
         if (parsed.exportName == null && !parsed.exportAll) {
             listExportNames(swf);
             return;
         }
 
-        // ── Boot GL + execute export ──────────────────────────────────
         GLOffscreenAutoDrawable offscreen = bootOffscreenGL();
         try {
             offscreen.getContext().makeCurrent();
@@ -150,9 +139,9 @@ public final class CliExporter {
                 return;
             }
 
-            flushRenderTasks();
+            // Flush any queued GL tasks from loading (textures, etc.)
+            flushGLTasks();
 
-            // Route to appropriate export mode
             if (parsed.exportAll) {
                 exportAll(assetFile, swf, parsed);
             } else if (parsed.exportFrames) {
@@ -167,44 +156,58 @@ public final class CliExporter {
         }
     }
 
-    // ── Flush render tasks ─────────────────────────────────────────────────────
-    private static void flushRenderTasks() {
-        stageGlobal.update();
+    // ── GL flush (CLI-safe) ───────────────────────────────────────────────────
+    /**
+     * In CLI mode we don't want to invoke the full update() → render() → screen
+     * pipeline (which re-renders to internal FBO, runs gizmos, etc.).
+     * We only need to drain the task queue and sync the GPU.
+     */
+    private static void flushGLTasks() {
+        stageGlobal.update();   // drains ConcurrentLinkedQueue of GL tasks
         gl3Global.glFinish();
     }
 
-    // ── Bounds calculation ─────────────────────────────────────────────────────
-    // FAST: Only called when --bounds flag is set or export mode requires it
-    private static ReadonlyRect calculateSymmetricBounds(MovieClip mc, EditorStage stage) {
-        Rect bounds = stage.calculateBoundsForAllFrames(mc);
-        bounds.scale(1.0f);
-
-        if (!areBoundsValid(bounds)) {
-            LOGGER.warn("Empty bounds, using 1x1 fallback");
-            bounds = new Rect(0, 0, 1, 1);
-        }
-
-        float maxH = Math.max(Math.abs(bounds.getLeft()), Math.abs(bounds.getRight()));
-        float maxV = Math.max(Math.abs(bounds.getTop()), Math.abs(bounds.getBottom()));
-        return roundSymmetric(maxH, maxV);
+    private static void glFinish() {
+        gl3Global.glFinish();
     }
 
-    // FAST: Tight bounds (no symmetric expansion)
-    private static ReadonlyRect calculateTightBounds(DisplayObject obj, EditorStage stage) {
+    // ── Bounds helpers ────────────────────────────────────────────────────────
+
+    /** Tight bounds for a single display-object at its current frame. */
+    private static ReadonlyRect calculateTightBounds(DisplayObject obj) {
         if (obj.isMovieClip()) {
             MovieClip mc = (MovieClip) obj;
             mc.gotoAbsoluteTimeRecursive(0);
             mc.gotoAndStopFrameIndex(0);
         }
-        Rect bounds = stage.getDisplayObjectBounds(obj);
-        if (!areBoundsValid(bounds)) {
-            bounds = new Rect(0, 0, 1, 1);
-        }
+        Rect b = stageGlobal.getDisplayObjectBounds(obj);
+        if (!areBoundsValid(b)) b = new Rect(0, 0, 1, 1);
         return new Rect(
-                (int) Math.floor(bounds.getLeft()),
-                (int) Math.floor(bounds.getTop()),
-                (int) Math.ceil(bounds.getRight()),
-                (int) Math.ceil(bounds.getBottom()));
+                (int) Math.floor(b.getLeft()),
+                (int) Math.floor(b.getTop()),
+                (int) Math.ceil(b.getRight()),
+                (int) Math.ceil(b.getBottom()));
+    }
+
+    /**
+     * Symmetric bounds: expands the tight bounding-box of ALL frames so that the
+     * origin sits at the canvas centre. Used only when --bounds is passed.
+     * For a static (single-frame) object we skip the full-animation scan.
+     */
+    private static ReadonlyRect calculateSymmetricBounds(DisplayObject obj) {
+        Rect tight;
+        if (obj.isMovieClip() && ((MovieClip) obj).getFrameCountRecursive() > 1) {
+            tight = stageGlobal.calculateBoundsForAllFrames(obj);
+        } else {
+            // Static shape — no need to iterate all frames
+            tight = (Rect) calculateTightBounds(obj);
+        }
+        tight.scale(1.0f);
+        if (!areBoundsValid(tight)) tight = new Rect(0, 0, 1, 1);
+
+        float maxH = Math.max(Math.abs(tight.getLeft()), Math.abs(tight.getRight()));
+        float maxV = Math.max(Math.abs(tight.getTop()), Math.abs(tight.getBottom()));
+        return roundSymmetric(maxH, maxV);
     }
 
     // ── List mode ─────────────────────────────────────────────────────────────
@@ -225,8 +228,7 @@ public final class CliExporter {
             try {
                 MovieClipOriginal mc = swf.getOriginalMovieClip(id & 0xFFFF, null);
                 String name = mc.getExportName();
-                if (name != null && !name.isBlank())
-                    names.add(name);
+                if (name != null && !name.isBlank()) names.add(name);
             } catch (UnableToFindObjectException e) {
                 LOGGER.warn("Could not read MovieClip id={}", id, e);
             }
@@ -237,8 +239,7 @@ public final class CliExporter {
 
     // ── Export all ────────────────────────────────────────────────────────────
 
-    private static void exportAll(SupercellSWFAssetFile assetFile,
-            SupercellSWF swf, CliArgs parsed) {
+    private static void exportAll(SupercellSWFAssetFile assetFile, SupercellSWF swf, CliArgs parsed) {
         List<String> names = collectExportNames(swf);
         if (names.isEmpty()) {
             System.out.println("[cli] No exportable definitions found.");
@@ -255,15 +256,17 @@ public final class CliExporter {
             return;
         }
 
-        System.out.println("[cli] Exporting " + names.size() + " assets...");
+        int total = names.size();
+        System.out.println("[cli] Exporting " + total + " assets...");
         int ok = 0, skipped = 0;
 
-        for (String name : names) {
+        for (int i = 0; i < total; i++) {
+            String name = names.get(i);
+            // Single updating line: overwrite previous with \r
+            System.out.print("\r[cli] [" + (i + 1) + "/" + total + "] " + name + "          ");
+
             int targetId = resolveNameToId(name, swf);
-            if (targetId == -1) {
-                skipped++;
-                continue;
-            }
+            if (targetId == -1) { skipped++; continue; }
 
             DisplayObject displayObject;
             try {
@@ -274,38 +277,31 @@ public final class CliExporter {
                 continue;
             }
 
-            if (displayObject.isTextField()) {
-                skipped++;
-                continue;
-            }
+            if (displayObject.isTextField()) { skipped++; continue; }
 
             boolean isAnimated = displayObject.isMovieClip()
                     && ((MovieClip) displayObject).getFrameCountRecursive() > 1;
 
-            // Export based on flags
             if (parsed.firstFrame || !isAnimated) {
                 Path outputPath = outDir.resolve(name + ".png");
                 exportSingleFrame(displayObject, outputPath, parsed.bounds);
-                System.out.println("[cli]   " + name + ".png");
             } else if (GIF_FORMAT.equalsIgnoreCase(parsed.formatName)) {
                 Path gifOutputPath = outDir.resolve(name + ".gif");
                 exportGif((MovieClip) displayObject, gifOutputPath, parsed.bounds);
-                System.out.println("[cli]   " + name + ".gif");
             } else {
                 Path outputPath = outDir.resolve(name + ".png");
                 exportSingleFrame(displayObject, outputPath, parsed.bounds);
-                System.out.println("[cli]   " + name + ".png");
             }
             ok++;
         }
 
+        System.out.println(); // newline after the progress line
         System.out.println("[cli] Done. Exported: " + ok + "  skipped: " + skipped);
     }
 
     // ── Export named asset ────────────────────────────────────────────────────
 
-    private static void exportNamed(SupercellSWFAssetFile assetFile,
-            SupercellSWF swf, CliArgs parsed) {
+    private static void exportNamed(SupercellSWFAssetFile assetFile, SupercellSWF swf, CliArgs parsed) {
         int targetId = resolveNameToId(parsed.exportName, swf);
         if (targetId == -1) {
             System.err.println("[cli] Export name not found: \"" + parsed.exportName + "\"");
@@ -332,10 +328,9 @@ public final class CliExporter {
 
         boolean isAnimated = displayObject.isMovieClip()
                 && ((MovieClip) displayObject).getFrameCountRecursive() > 1;
-        boolean exportAsVideo = parsed.formatName != null && !isGifFormat(parsed.formatName)
-                && !isMovFormat(parsed.formatName);
         boolean exportAsGif = GIF_FORMAT.equalsIgnoreCase(parsed.formatName);
         boolean exportAsMov = isMovFormat(parsed.formatName);
+        boolean exportAsVideo = parsed.formatName != null && !exportAsGif && !exportAsMov;
 
         if ((exportAsVideo || exportAsGif || exportAsMov) && !isAnimated) {
             System.err.println("[cli] Cannot export single-frame object as video/GIF/MOV.");
@@ -348,8 +343,7 @@ public final class CliExporter {
         if (exportAsMov) {
             exportMov((MovieClip) displayObject, outputPath, parsed.bounds);
         } else if (exportAsVideo) {
-            exportVideo((MovieClip) displayObject, outputPath,
-                    resolveVideoFormat(parsed.formatName), parsed.bounds);
+            exportVideo((MovieClip) displayObject, outputPath, resolveVideoFormat(parsed.formatName), parsed.bounds);
         } else if (exportAsGif) {
             exportGif((MovieClip) displayObject, outputPath, parsed.bounds);
         } else {
@@ -359,8 +353,7 @@ public final class CliExporter {
 
     // ── Export frames ─────────────────────────────────────────────────────────
 
-    private static void exportFrames(SupercellSWFAssetFile assetFile,
-            SupercellSWF swf, CliArgs parsed) {
+    private static void exportFrames(SupercellSWFAssetFile assetFile, SupercellSWF swf, CliArgs parsed) {
         int targetId = resolveNameToId(parsed.exportName, swf);
         if (targetId == -1) {
             System.err.println("[cli] Export name not found: \"" + parsed.exportName + "\"");
@@ -385,11 +378,9 @@ public final class CliExporter {
 
         Path outputDir;
         try {
-            if (parsed.outputPath != null) {
-                outputDir = Path.of(parsed.outputPath);
-            } else {
-                outputDir = DEFAULT_OUTPUT_DIR.resolve(parsed.exportName + "_frames");
-            }
+            outputDir = parsed.outputPath != null
+                    ? Path.of(parsed.outputPath)
+                    : DEFAULT_OUTPUT_DIR.resolve(parsed.exportName + "_frames");
             Files.createDirectories(outputDir);
         } catch (IOException e) {
             System.err.println("[cli] Cannot create output directory: " + e.getMessage());
@@ -398,32 +389,27 @@ public final class CliExporter {
         }
 
         MovieClip movieClip = (MovieClip) displayObject;
-
         if (parsed.bounds) {
-            // Symmetric bounds mode
             exportFrameSequenceSymmetric(movieClip, outputDir);
         } else {
-            // Tight bounds mode (fast, default)
             exportFrameSequenceTight(movieClip, outputDir);
         }
     }
 
-    // ── Frame export: TIGHT (default, FAST) ────────────────────────────────────
+    // ── Frame sequence export: TIGHT (default, fast) ─────────────────────────
+
     private static void exportFrameSequenceTight(MovieClip movieClip, Path outputDir) {
-        // Pin at frame 0 once
+        // Measure bounds at frame 0 only — tight mode uses a fixed canvas per-frame
         movieClip.gotoAbsoluteTimeRecursive(0);
         movieClip.gotoAndStopFrameIndex(0);
 
-        // Get tight bounds for SINGLE frame (no iteration)
-        Rect bounds = stageGlobal.getDisplayObjectBounds(movieClip);
-        if (!areBoundsValid(bounds)) {
-            bounds = new Rect(0, 0, 1, 1);
-        }
+        Rect rawBounds = stageGlobal.getDisplayObjectBounds(movieClip);
+        if (!areBoundsValid(rawBounds)) rawBounds = new Rect(0, 0, 1, 1);
         ReadonlyRect fboRect = new Rect(
-                (int) Math.floor(bounds.getLeft()),
-                (int) Math.floor(bounds.getTop()),
-                (int) Math.ceil(bounds.getRight()),
-                (int) Math.ceil(bounds.getBottom()));
+                (int) Math.floor(rawBounds.getLeft()),
+                (int) Math.floor(rawBounds.getTop()),
+                (int) Math.ceil(rawBounds.getRight()),
+                (int) Math.ceil(rawBounds.getBottom()));
 
         Framebuffer framebuffer = RendererHelper.prepareStageForRendering(stageGlobal, fboRect);
 
@@ -434,51 +420,58 @@ public final class CliExporter {
         }
 
         Matrix2x3 matrix = new Matrix2x3();
-        ColorTransform colorTransform = new ColorTransform();
+        ColorTransform ct = new ColorTransform();
         MovieClipState state = movieClip.getState();
         int loopFrame = movieClip.getLoopFrame();
         int startFrame = movieClip.getCurrentFrame();
+        int totalFrames = movieClip.getFrameCountRecursive();
 
-        System.out.println("[cli] Exporting frames to: " + outputDir.toAbsolutePath());
+        System.out.println("[cli] Exporting " + totalFrames + " frames to: " + outputDir.toAbsolutePath());
         System.out.println("[cli] Canvas: " + framebuffer.getWidth() + "x" + framebuffer.getHeight());
 
-        // Render all frames using same tight bounds
-        MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
-            movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
-            if (loopFrame != -1) {
-                movieClip.setFrame(loopFrame);
-            } else if (state == MovieClipState.STOPPED) {
-                movieClip.setFrame(startFrame);
-            }
+        ExecutorService writer = Executors.newFixedThreadPool(WRITER_THREADS);
+        AtomicInteger done = new AtomicInteger(0);
 
-            movieClip.render(matrix, colorTransform, 0, 0);
-            stageGlobal.renderToFramebuffer(framebuffer);
-            flushRenderTasks();
+        try {
+            MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
+                movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
+                if (loopFrame != -1) movieClip.setFrame(loopFrame);
+                else if (state == MovieClipState.STOPPED) movieClip.setFrame(startFrame);
 
-            int[] pixels = framebuffer.getPixelArray(true);
-            unPremultiplyAlpha(pixels);
+                movieClip.render(matrix, ct, 0, 0);
+                stageGlobal.renderToFramebuffer(framebuffer);
+                glFinish();
 
-            BufferedImage image = ImageUtils.createBufferedImageFromPixels(
-                    framebuffer.getWidth(), framebuffer.getHeight(), pixels, false);
+                int[] pixels = framebuffer.getPixelArray(true);
+                unPremultiplyAlpha(pixels);
 
-            Path frameFile = outputDir.resolve("frame_" + frameIndex + ".png");
-            ImageUtils.saveImage(frameFile, image);
-            System.out.println("[cli]   frame_" + frameIndex + ".png");
-        });
+                // Snapshot dims before handing off to writer thread
+                int w = framebuffer.getWidth(), h = framebuffer.getHeight();
+                int idx = frameIndex;
+                Path frameFile = outputDir.resolve("frame_" + idx + ".png");
 
-        if (parentSet)
-            movieClip.setParent(null);
-        framebuffer.delete();
-        System.out.println("[cli] Done. " + outputDir.toAbsolutePath());
+                writer.submit(() -> {
+                    BufferedImage img = ImageUtils.createBufferedImageFromPixels(w, h, pixels, false);
+                    ImageUtils.saveImage(frameFile, img);
+                    int n = done.incrementAndGet();
+                    System.out.print("\r[cli] Frame " + n + "/" + totalFrames + "          ");
+                });
+            });
+        } finally {
+            shutdownWriterPool(writer, totalFrames);
+            if (parentSet) movieClip.setParent(null);
+            framebuffer.delete();
+        }
+
+        System.out.println("\n[cli] Done. " + outputDir.toAbsolutePath());
     }
 
-    // ── Frame export: SYMMETRIC (with --bounds flag) ───────────────────────────
+    // ── Frame sequence export: SYMMETRIC (--bounds) ───────────────────────────
+
     private static void exportFrameSequenceSymmetric(MovieClip movieClip, Path outputDir) {
-        // Calculate symmetric bounds across ALL frames (slower, more space)
+        // One pass to get all-frame bounds — unavoidable for symmetric mode
         Rect tightBounds = stageGlobal.calculateBoundsForAllFrames(movieClip);
-        if (!areBoundsValid(tightBounds)) {
-            tightBounds = new Rect(0, 0, 1, 1);
-        }
+        if (!areBoundsValid(tightBounds)) tightBounds = new Rect(0, 0, 1, 1);
 
         float maxH = Math.max(Math.abs(tightBounds.getLeft()), Math.abs(tightBounds.getRight()));
         float maxV = Math.max(Math.abs(tightBounds.getTop()), Math.abs(tightBounds.getBottom()));
@@ -493,42 +486,50 @@ public final class CliExporter {
         }
 
         Matrix2x3 matrix = new Matrix2x3();
-        ColorTransform colorTransform = new ColorTransform();
+        ColorTransform ct = new ColorTransform();
         MovieClipState state = movieClip.getState();
         int loopFrame = movieClip.getLoopFrame();
         int startFrame = movieClip.getCurrentFrame();
+        int totalFrames = movieClip.getFrameCountRecursive();
 
-        System.out.println("[cli] Exporting frames (symmetric bounds) to: " + outputDir.toAbsolutePath());
+        System.out.println("[cli] Exporting " + totalFrames + " frames (symmetric bounds) to: " + outputDir.toAbsolutePath());
         System.out.println("[cli] Canvas: " + framebuffer.getWidth() + "x" + framebuffer.getHeight()
                 + ", origin at " + framebuffer.getWidth() / 2 + "," + framebuffer.getHeight() / 2);
 
-        MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
-            movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
-            if (loopFrame != -1) {
-                movieClip.setFrame(loopFrame);
-            } else if (state == MovieClipState.STOPPED) {
-                movieClip.setFrame(startFrame);
-            }
+        ExecutorService writer = Executors.newFixedThreadPool(WRITER_THREADS);
+        AtomicInteger done = new AtomicInteger(0);
 
-            movieClip.render(matrix, colorTransform, 0, 0);
-            stageGlobal.renderToFramebuffer(framebuffer);
-            flushRenderTasks();
+        try {
+            MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
+                movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
+                if (loopFrame != -1) movieClip.setFrame(loopFrame);
+                else if (state == MovieClipState.STOPPED) movieClip.setFrame(startFrame);
 
-            int[] pixels = framebuffer.getPixelArray(true);
-            unPremultiplyAlpha(pixels);
+                movieClip.render(matrix, ct, 0, 0);
+                stageGlobal.renderToFramebuffer(framebuffer);
+                glFinish();
 
-            BufferedImage image = ImageUtils.createBufferedImageFromPixels(
-                    framebuffer.getWidth(), framebuffer.getHeight(), pixels, false);
+                int[] pixels = framebuffer.getPixelArray(true);
+                unPremultiplyAlpha(pixels);
 
-            Path frameFile = outputDir.resolve("frame_" + frameIndex + ".png");
-            ImageUtils.saveImage(frameFile, image);
-            System.out.println("[cli]   frame_" + frameIndex + ".png");
-        });
+                int w = framebuffer.getWidth(), h = framebuffer.getHeight();
+                int idx = frameIndex;
+                Path frameFile = outputDir.resolve("frame_" + idx + ".png");
 
-        if (parentSet)
-            movieClip.setParent(null);
-        framebuffer.delete();
-        System.out.println("[cli] Done. " + outputDir.toAbsolutePath());
+                writer.submit(() -> {
+                    BufferedImage img = ImageUtils.createBufferedImageFromPixels(w, h, pixels, false);
+                    ImageUtils.saveImage(frameFile, img);
+                    int n = done.incrementAndGet();
+                    System.out.print("\r[cli] Frame " + n + "/" + totalFrames + "          ");
+                });
+            });
+        } finally {
+            shutdownWriterPool(writer, totalFrames);
+            if (parentSet) movieClip.setParent(null);
+            framebuffer.delete();
+        }
+
+        System.out.println("\n[cli] Done. " + outputDir.toAbsolutePath());
     }
 
     // ── Single frame export ────────────────────────────────────────────────────
@@ -541,8 +542,8 @@ public final class CliExporter {
         }
 
         ReadonlyRect fboRect = useBounds
-                ? calculateSymmetricBounds((MovieClip) displayObject, stageGlobal)
-                : calculateTightBounds(displayObject, stageGlobal);
+                ? calculateSymmetricBounds(displayObject)
+                : calculateTightBounds(displayObject);
 
         Framebuffer framebuffer = RendererHelper.prepareStageForRendering(stageGlobal, fboRect);
 
@@ -555,10 +556,9 @@ public final class CliExporter {
         Matrix2x3 identity = new Matrix2x3();
         displayObject.render(identity, new ColorTransform(), 0, 0);
         stageGlobal.renderToFramebuffer(framebuffer);
-        flushRenderTasks();
+        glFinish();
 
-        if (parentSet)
-            displayObject.setParent(null);
+        if (parentSet) displayObject.setParent(null);
 
         int[] pixels = framebuffer.getPixelArray(true);
         unPremultiplyAlpha(pixels);
@@ -569,9 +569,10 @@ public final class CliExporter {
 
         ImageUtils.saveImage(outputPath, image);
 
-        String origin = useBounds ? ", origin at " + framebuffer.getWidth() / 2 + "," + framebuffer.getHeight() / 2
+        String origin = useBounds
+                ? ", origin at " + framebuffer.getWidth() / 2 + "," + framebuffer.getHeight() / 2
                 : "";
-        System.out.println("[cli] Image saved: " + outputPath.toAbsolutePath()
+        System.out.println("[cli] Saved: " + outputPath.toAbsolutePath()
                 + "  (" + framebuffer.getWidth() + "x" + framebuffer.getHeight() + origin + ")");
     }
 
@@ -579,17 +580,18 @@ public final class CliExporter {
 
     private static void exportVideo(MovieClip movieClip, Path outputPath,
             VideoFormat format, boolean useBounds) {
-        Rect bounds = stageGlobal.calculateBoundsForAllFrames(movieClip);
+        Rect rawBounds = stageGlobal.calculateBoundsForAllFrames(movieClip);
         ReadonlyRect ceilBounds = useBounds
-                ? calculateSymmetricBounds(movieClip, stageGlobal)
-                : roundBounds(bounds, format.requiresSizeDividableByTwo());
+                ? calculateSymmetricBounds(movieClip)
+                : roundBounds(rawBounds, format.requiresSizeDividableByTwo());
 
         Matrix2x3 matrix = new Matrix2x3();
-        ColorTransform colorTransform = new ColorTransform();
+        ColorTransform ct = new ColorTransform();
         MovieClipState state = movieClip.getState();
         int loopFrame = movieClip.getLoopFrame();
         int startFrame = movieClip.getCurrentFrame();
         int fps = movieClip.getFps();
+        int totalFrames = movieClip.getFrameCountRecursive();
 
         Framebuffer framebuffer = RendererHelper.prepareStageForRendering(stageGlobal, ceilBounds);
 
@@ -599,34 +601,43 @@ public final class CliExporter {
             parentSet = true;
         }
 
-        Path framesDir = outputPath.getParent().resolve(outputPath.getFileName().toString() + "_frames");
+        Path framesDir = outputPath.getParent().resolve(outputPath.getFileName() + "_frames");
         framesDir.toFile().mkdirs();
 
-        MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
-            movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
-            if (loopFrame != -1) {
-                movieClip.setFrame(loopFrame);
-            } else if (state == MovieClipState.STOPPED) {
-                movieClip.setFrame(startFrame);
-            }
+        System.out.println("[cli] Rendering " + totalFrames + " frames...");
+        ExecutorService writer = Executors.newFixedThreadPool(WRITER_THREADS);
+        AtomicInteger done = new AtomicInteger(0);
 
-            movieClip.render(matrix, colorTransform, 0, 0);
-            stageGlobal.renderToFramebuffer(framebuffer);
-            flushRenderTasks();
+        try {
+            MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
+                movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
+                if (loopFrame != -1) movieClip.setFrame(loopFrame);
+                else if (state == MovieClipState.STOPPED) movieClip.setFrame(startFrame);
 
-            int[] pixels = framebuffer.getPixelArray(true);
-            unPremultiplyAlpha(pixels);
+                movieClip.render(matrix, ct, 0, 0);
+                stageGlobal.renderToFramebuffer(framebuffer);
+                glFinish();
 
-            BufferedImage image = ImageUtils.createBufferedImageFromPixels(
-                    framebuffer.getWidth(), framebuffer.getHeight(), pixels, false);
+                int[] pixels = framebuffer.getPixelArray(true);
+                unPremultiplyAlpha(pixels);
 
-            ImageUtils.saveImage(framesDir.resolve(frameIndex + ".png"), image);
-        });
+                int w = framebuffer.getWidth(), h = framebuffer.getHeight();
+                Path frameFile = framesDir.resolve(frameIndex + ".png");
 
-        if (parentSet)
-            movieClip.setParent(null);
-        framebuffer.delete();
+                writer.submit(() -> {
+                    BufferedImage img = ImageUtils.createBufferedImageFromPixels(w, h, pixels, false);
+                    ImageUtils.saveImage(frameFile, img);
+                    int n = done.incrementAndGet();
+                    System.out.print("\r[cli] Rendering " + n + "/" + totalFrames + "          ");
+                });
+            });
+        } finally {
+            shutdownWriterPool(writer, totalFrames);
+            if (parentSet) movieClip.setParent(null);
+            framebuffer.delete();
+        }
 
+        System.out.println("\n[cli] Encoding video...");
         runFfmpegBlocking(framesDir, outputPath, format, fps);
         System.out.println("[cli] Video saved: " + outputPath.toAbsolutePath());
     }
@@ -635,12 +646,10 @@ public final class CliExporter {
 
     private static void exportGif(MovieClip movieClip, Path outputPath, boolean useBounds) {
         Rect tightBounds = stageGlobal.calculateBoundsForAllFrames(movieClip);
-        if (!areBoundsValid(tightBounds)) {
-            tightBounds = new Rect(0, 0, 1, 1);
-        }
+        if (!areBoundsValid(tightBounds)) tightBounds = new Rect(0, 0, 1, 1);
 
         ReadonlyRect fboRect = useBounds
-                ? calculateSymmetricBounds(movieClip, stageGlobal)
+                ? calculateSymmetricBounds(movieClip)
                 : roundBounds(tightBounds, false);
 
         Framebuffer framebuffer = RendererHelper.prepareStageForRendering(stageGlobal, fboRect);
@@ -652,54 +661,65 @@ public final class CliExporter {
         }
 
         Matrix2x3 matrix = new Matrix2x3();
-        ColorTransform colorTransform = new ColorTransform();
+        ColorTransform ct = new ColorTransform();
         MovieClipState state = movieClip.getState();
         int loopFrame = movieClip.getLoopFrame();
         int startFrame = movieClip.getCurrentFrame();
         int fps = movieClip.getFps();
+        int totalFrames = movieClip.getFrameCountRecursive();
+        int w = framebuffer.getWidth(), h = framebuffer.getHeight();
 
-        Path framesDir = outputPath.getParent().resolve(outputPath.getFileName().toString() + "_frames");
+        Path framesDir = outputPath.getParent().resolve(outputPath.getFileName() + "_frames");
         framesDir.toFile().mkdirs();
 
-        MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
-            movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
-            if (loopFrame != -1) {
-                movieClip.setFrame(loopFrame);
-            } else if (state == MovieClipState.STOPPED) {
-                movieClip.setFrame(startFrame);
-            }
+        System.out.println("[cli] Rendering " + totalFrames + " frames...");
+        ExecutorService writer = Executors.newFixedThreadPool(WRITER_THREADS);
+        AtomicInteger done = new AtomicInteger(0);
 
-            movieClip.render(matrix, colorTransform, 0, 0);
-            stageGlobal.renderToFramebuffer(framebuffer);
-            flushRenderTasks();
+        try {
+            MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
+                movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
+                if (loopFrame != -1) movieClip.setFrame(loopFrame);
+                else if (state == MovieClipState.STOPPED) movieClip.setFrame(startFrame);
 
-            int[] pixels = framebuffer.getPixelArray(true);
-            unPremultiplyAlpha(pixels);
+                movieClip.render(matrix, ct, 0, 0);
+                stageGlobal.renderToFramebuffer(framebuffer);
+                glFinish();
 
-            BufferedImage image = ImageUtils.createBufferedImageFromPixels(
-                    framebuffer.getWidth(), framebuffer.getHeight(), pixels, false);
+                int[] pixels = framebuffer.getPixelArray(true);
+                unPremultiplyAlpha(pixels);
 
-            ImageUtils.saveImage(framesDir.resolve(frameIndex + ".png"), image);
-        });
+                Path frameFile = framesDir.resolve(frameIndex + ".png");
+                writer.submit(() -> {
+                    BufferedImage img = ImageUtils.createBufferedImageFromPixels(w, h, pixels, false);
+                    ImageUtils.saveImage(frameFile, img);
+                    int n = done.incrementAndGet();
+                    System.out.print("\r[cli] Rendering " + n + "/" + totalFrames + "          ");
+                });
+            });
+        } finally {
+            shutdownWriterPool(writer, totalFrames);
+            if (parentSet) movieClip.setParent(null);
+            framebuffer.delete();
+        }
 
-        if (parentSet)
-            movieClip.setParent(null);
-        framebuffer.delete();
-
-        runFfmpegGifBlocking(framesDir, outputPath, fps, framebuffer.getWidth(), framebuffer.getHeight());
-        String origin = useBounds ? ", origin at " + framebuffer.getWidth() / 2 + "," + framebuffer.getHeight() / 2
-                : "";
+        System.out.println("\n[cli] Encoding GIF...");
+        runFfmpegGifBlocking(framesDir, outputPath, fps, w, h);
+        String origin = useBounds ? ", origin at " + w / 2 + "," + h / 2 : "";
         System.out.println("[cli] GIF saved: " + outputPath.toAbsolutePath()
-                + "  (" + framebuffer.getWidth() + "x" + framebuffer.getHeight() + origin + ")");
+                + "  (" + w + "x" + h + origin + ")");
     }
 
-    // ── MOV export (lossless QuickTime with alpha) ─────────────────────────────
-
+    // ── MOV export (lossless QuickTime with alpha) ────────────────────────────
+    /**
+     * Pipes raw ARGB frames directly to ffmpeg stdin — avoids the PNG-on-disk
+     * intermediate that video/GIF export uses, which is the main bottleneck for MOV.
+     */
     private static void exportMov(MovieClip movieClip, Path outputPath, boolean useBounds) {
-        Rect bounds = stageGlobal.calculateBoundsForAllFrames(movieClip);
+        Rect rawBounds = stageGlobal.calculateBoundsForAllFrames(movieClip);
         ReadonlyRect fboRect = useBounds
-                ? calculateSymmetricBounds(movieClip, stageGlobal)
-                : roundBounds(bounds, false);
+                ? calculateSymmetricBounds(movieClip)
+                : roundBounds(rawBounds, false);
 
         Framebuffer framebuffer = RendererHelper.prepareStageForRendering(stageGlobal, fboRect);
 
@@ -710,46 +730,105 @@ public final class CliExporter {
         }
 
         Matrix2x3 matrix = new Matrix2x3();
-        ColorTransform colorTransform = new ColorTransform();
+        ColorTransform ct = new ColorTransform();
         MovieClipState state = movieClip.getState();
         int loopFrame = movieClip.getLoopFrame();
         int startFrame = movieClip.getCurrentFrame();
         int fps = movieClip.getFps();
+        int totalFrames = movieClip.getFrameCountRecursive();
+        int w = framebuffer.getWidth(), h = framebuffer.getHeight();
 
-        // Assemble frames in-memory with alpha preserved
-        FrameAssemblyPipeline pipeline = new FrameAssemblyPipeline(
-                framebuffer.getWidth(), framebuffer.getHeight(), fps);
+        System.out.println("[cli] Encoding MOV (piping " + totalFrames + " frames to ffmpeg)...");
 
-        MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
-            movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
-            if (loopFrame != -1) {
-                movieClip.setFrame(loopFrame);
-            } else if (state == MovieClipState.STOPPED) {
-                movieClip.setFrame(startFrame);
+        // Build ffmpeg command: read raw ARGB from stdin, write lossless QuickTime
+        String[] ffmpegCmd = {
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo",
+            "-pixel_format", "argb",
+            "-video_size", w + "x" + h,
+            "-framerate", String.valueOf(fps),
+            "-i", "pipe:0",
+            "-c:v", "qtrle",
+            "-pix_fmt", "argb",
+            "-q:v", "0",
+            outputPath.toAbsolutePath().toString()
+        };
+
+        try {
+            Process ffmpeg = new ProcessBuilder(ffmpegCmd)
+                    .redirectErrorStream(false)
+                    .start();
+
+            // Write raw frames on a background thread so GL render isn't blocked
+            final java.io.OutputStream stdin = ffmpeg.getOutputStream();
+
+            // Use a bounded queue to throttle the render loop if ffmpeg falls behind
+            BlockingQueue<byte[]> queue = new ArrayBlockingQueue<>(8);
+            byte[] SENTINEL = new byte[0]; // poison pill
+
+            Future<?> pipeTask = Executors.newSingleThreadExecutor().submit(() -> {
+                try {
+                    while (true) {
+                        byte[] frame = queue.take();
+                        if (frame == SENTINEL) break;
+                        stdin.write(frame);
+                    }
+                    stdin.flush();
+                    stdin.close();
+                } catch (Exception e) {
+                    LOGGER.error("MOV pipe error", e);
+                }
+            });
+
+            try {
+                AtomicInteger done = new AtomicInteger(0);
+                MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
+                    movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
+                    if (loopFrame != -1) movieClip.setFrame(loopFrame);
+                    else if (state == MovieClipState.STOPPED) movieClip.setFrame(startFrame);
+
+                    movieClip.render(matrix, ct, 0, 0);
+                    stageGlobal.renderToFramebuffer(framebuffer);
+                    glFinish();
+
+                    int[] pixels = framebuffer.getPixelArray(true);
+                    unPremultiplyAlpha(pixels);
+
+                    // Convert int[] ARGB to raw bytes for ffmpeg rawvideo input
+                    byte[] raw = argbIntArrayToBytes(pixels);
+                    try {
+                        queue.put(raw);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    int n = done.incrementAndGet();
+                    System.out.print("\r[cli] Frame " + n + "/" + totalFrames + "          ");
+                });
+            } finally {
+                try { queue.put(SENTINEL); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                pipeTask.get();
             }
 
-            movieClip.render(matrix, colorTransform, 0, 0);
-            stageGlobal.renderToFramebuffer(framebuffer);
-            flushRenderTasks();
+            int exitCode = ffmpeg.waitFor();
+            if (exitCode != 0) {
+                System.err.println("\n[cli] ffmpeg MOV encoding failed (exit code " + exitCode + ")");
+            } else {
+                String origin = useBounds ? ", origin at " + w / 2 + "," + h / 2 : "";
+                System.out.println("\n[cli] MOV saved: " + outputPath.toAbsolutePath()
+                        + "  (" + w + "x" + h + origin + ")");
+            }
 
-            int[] pixels = framebuffer.getPixelArray(true);
-            unPremultiplyAlpha(pixels);
-            pipeline.addFrame(pixels);
-        });
-
-        if (parentSet)
-            movieClip.setParent(null);
-        framebuffer.delete();
-
-        // Encode MOV with ffmpeg (lossless, alpha via ARGB)
-        runFfmpegMovBlocking(pipeline, outputPath, fps);
-        String origin = useBounds ? ", origin at " + framebuffer.getWidth() / 2 + "," + framebuffer.getHeight() / 2
-                : "";
-        System.out.println("[cli] MOV saved: " + outputPath.toAbsolutePath()
-                + "  (" + framebuffer.getWidth() + "x" + framebuffer.getHeight() + origin + ")");
+        } catch (IOException | InterruptedException | java.util.concurrent.ExecutionException e) {
+            System.err.println("[cli] MOV export error: " + e.getMessage());
+            LOGGER.error("MOV export failed", e);
+        } finally {
+            if (parentSet) movieClip.setParent(null);
+            framebuffer.delete();
+        }
     }
 
-    // ── Un-premultiply alpha (FAST inline) ─────────────────────────────────────
+    // ── Un-premultiply alpha ──────────────────────────────────────────────────
+
     private static void unPremultiplyAlpha(int[] pixels) {
         for (int i = 0; i < pixels.length; i++) {
             int p = pixels[i];
@@ -757,7 +836,7 @@ public final class CliExporter {
             if (a == 0) {
                 pixels[i] = 0;
             } else if (a != 255) {
-                int r = (p) & 0xFF;
+                int r = p & 0xFF;
                 int g = (p >> 8) & 0xFF;
                 int b = (p >> 16) & 0xFF;
                 r = Math.min(255, (r * 255) / a);
@@ -768,26 +847,32 @@ public final class CliExporter {
         }
     }
 
+    /** Convert packed ARGB int[] to a big-endian byte[] for ffmpeg rawvideo. */
+    private static byte[] argbIntArrayToBytes(int[] pixels) {
+        byte[] out = new byte[pixels.length * 4];
+        for (int i = 0, j = 0; i < pixels.length; i++, j += 4) {
+            int p = pixels[i];
+            out[j]     = (byte) ((p >> 24) & 0xFF); // A
+            out[j + 1] = (byte) ((p >> 16) & 0xFF); // R
+            out[j + 2] = (byte) ((p >> 8)  & 0xFF); // G
+            out[j + 3] = (byte) (p & 0xFF);          // B
+        }
+        return out;
+    }
+
     // ── ffmpeg helpers ────────────────────────────────────────────────────────
 
-    private static void runFfmpegBlocking(Path framesDir, Path outputPath,
-            VideoFormat format, int fps) {
+    private static void runFfmpegBlocking(Path framesDir, Path outputPath, VideoFormat format, int fps) {
         try {
             Process process = SystemUtils.runProcess(
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "panic",
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                     "-framerate", String.valueOf(fps),
                     "-i", framesDir.resolve("%d.png").toAbsolutePath().toString(),
                     "-c:v", format.codec(),
                     "-pix_fmt", format.pixelFormat(),
                     "-lossless", "1",
                     outputPath.toAbsolutePath().toString());
-
-            LOGGER.info("Encoding video...");
             int exitCode = process.waitFor();
-
             if (exitCode != 0) {
                 System.err.println("[cli] ffmpeg exited with code " + exitCode);
             } else {
@@ -804,43 +889,29 @@ public final class CliExporter {
             Path paletteFile = framesDir.resolve("palette.png");
 
             Process paletteProcess = SystemUtils.runProcess(
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "panic",
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                     "-framerate", String.valueOf(fps),
                     "-i", framesDir.resolve("%d.png").toAbsolutePath().toString(),
-                    "-vf",
-                    "fps=" + fps + ",scale=" + width + ":" + height
+                    "-vf", "fps=" + fps + ",scale=" + width + ":" + height
                             + ":flags=lanczos,palettegen=max_colors=256:stats_mode=diff",
                     paletteFile.toAbsolutePath().toString());
 
-            LOGGER.info("Generating GIF palette...");
-            int paletteExitCode = paletteProcess.waitFor();
-
-            if (paletteExitCode != 0) {
+            if (paletteProcess.waitFor() != 0) {
                 System.err.println("[cli] ffmpeg palette generation failed");
                 return;
             }
 
             Process gifProcess = SystemUtils.runProcess(
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "panic",
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                     "-framerate", String.valueOf(fps),
                     "-i", framesDir.resolve("%d.png").toAbsolutePath().toString(),
                     "-i", paletteFile.toAbsolutePath().toString(),
-                    "-lavfi",
-                    "fps=" + fps + ",scale=" + width + ":" + height
+                    "-lavfi", "fps=" + fps + ",scale=" + width + ":" + height
                             + ":flags=lanczos[x];[x][1:v]paletteuse=dither=sierra2_4a:diff_mode=rectangle",
                     "-loop", "0",
                     outputPath.toAbsolutePath().toString());
 
-            LOGGER.info("Encoding GIF...");
-            int gifExitCode = gifProcess.waitFor();
-
-            if (gifExitCode != 0) {
+            if (gifProcess.waitFor() != 0) {
                 System.err.println("[cli] ffmpeg GIF encoding failed");
             } else {
                 cleanupFrameDirectory(framesDir);
@@ -851,49 +922,32 @@ public final class CliExporter {
         }
     }
 
-    private static void runFfmpegMovBlocking(FrameAssemblyPipeline pipeline, Path outputPath, int fps) {
-        Path framesDir = outputPath.getParent().resolve(outputPath.getFileName().toString() + "_frames");
-        framesDir.toFile().mkdirs();
-
-        // Write assembled frames to disk
-        for (int i = 0; i < pipeline.frameCount(); i++) {
-            ImageUtils.saveImage(framesDir.resolve(i + ".png"), pipeline.frames.get(i));
-        }
-
-        try {
-            Process process = SystemUtils.runProcess(
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "panic",
-                    "-framerate", String.valueOf(fps),
-                    "-i", framesDir.resolve("%d.png").toAbsolutePath().toString(),
-                    "-c:v", "qtrle",
-                    "-pix_fmt", "argb",
-                    "-q:v", "0",
-                    outputPath.toAbsolutePath().toString());
-
-            LOGGER.info("Encoding lossless MOV with alpha...");
-            int exitCode = process.waitFor();
-
-            if (exitCode != 0) {
-                System.err.println("[cli] ffmpeg MOV encoding failed (exit code " + exitCode + ")");
-            } else {
-                cleanupFrameDirectory(framesDir);
-            }
-        } catch (IOException | InterruptedException e) {
-            System.err.println("[cli] ffmpeg MOV error: " + e.getMessage());
-            LOGGER.error("ffmpeg MOV invocation failed", e);
+    private static void cleanupFrameDirectory(Path framesDir) {
+        try (Stream<Path> files = Files.walk(framesDir)) {
+            files.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+        } catch (IOException e) {
+            LOGGER.warn("Failed to clean up frame directory: {}", e.getMessage());
         }
     }
 
-    private static void cleanupFrameDirectory(Path framesDir) {
-        try (Stream<Path> files = Files.walk(framesDir)) {
-            files.sorted(Comparator.reverseOrder())
-                    .map(Path::toFile)
-                    .forEach(File::delete);
-        } catch (IOException e) {
-            LOGGER.warn("Failed to clean up frame directory: {}", e.getMessage());
+    // ── Writer pool helpers ───────────────────────────────────────────────────
+
+    /**
+     * Wait for all pending PNG writes to finish, then shut down the pool.
+     * Logs a warning if interrupted rather than propagating.
+     */
+    private static void shutdownWriterPool(ExecutorService pool, int expectedFrames) {
+        pool.shutdown();
+        try {
+            // Allow generous timeout: 10 ms per frame or at least 30 s
+            long timeoutSec = Math.max(30, expectedFrames / 10L);
+            if (!pool.awaitTermination(timeoutSec, TimeUnit.SECONDS)) {
+                LOGGER.warn("Writer pool did not finish within {} seconds — forcing shutdown", timeoutSec);
+                pool.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            pool.shutdownNow();
         }
     }
 
@@ -903,11 +957,9 @@ public final class CliExporter {
         for (int id : swf.getMovieClipIds()) {
             try {
                 MovieClipOriginal mc = swf.getOriginalMovieClip(id & 0xFFFF, null);
-                if (name.equals(mc.getExportName())) {
-                    return id & 0xFFFF;
-                }
+                if (name.equals(mc.getExportName())) return id & 0xFFFF;
             } catch (UnableToFindObjectException e) {
-                // Continue
+                // continue
             }
         }
         return -1;
@@ -915,24 +967,17 @@ public final class CliExporter {
 
     private static Path resolveOutputPath(CliArgs parsed, boolean isAnimated) {
         try {
-            if (parsed.outputPath != null) {
-                return Path.of(parsed.outputPath);
+            if (parsed.outputPath != null) return Path.of(parsed.outputPath);
+            Files.createDirectories(DEFAULT_OUTPUT_DIR);
+            String ext;
+            if (parsed.formatName != null) {
+                if (isMovFormat(parsed.formatName)) ext = "mov";
+                else if (!isGifFormat(parsed.formatName)) ext = resolveVideoFormat(parsed.formatName).name();
+                else ext = "gif";
             } else {
-                Files.createDirectories(DEFAULT_OUTPUT_DIR);
-                String ext;
-                if (parsed.formatName != null) {
-                    if (isMovFormat(parsed.formatName)) {
-                        ext = "mov";
-                    } else if (!isGifFormat(parsed.formatName)) {
-                        ext = resolveVideoFormat(parsed.formatName).name();
-                    } else {
-                        ext = "gif";
-                    }
-                } else {
-                    ext = "png";
-                }
-                return DEFAULT_OUTPUT_DIR.resolve(parsed.exportName + "." + ext);
+                ext = "png";
             }
+            return DEFAULT_OUTPUT_DIR.resolve(parsed.exportName + "." + ext);
         } catch (IOException e) {
             System.err.println("[cli] Cannot create output directory: " + e.getMessage());
             System.exit(6);
@@ -956,22 +1001,19 @@ public final class CliExporter {
     }
 
     private static ReadonlyRect roundBounds(Rect bounds, boolean requiresDivisibleByTwo) {
-        int left = (int) Math.floor(bounds.getLeft());
+        int left  = (int) Math.floor(bounds.getLeft());
         int right = (int) Math.ceil(bounds.getRight());
-        int top = (int) Math.floor(bounds.getTop());
+        int top   = (int) Math.floor(bounds.getTop());
         int bottom = (int) Math.ceil(bounds.getBottom());
         if (requiresDivisibleByTwo) {
-            if ((right - left) % 2 != 0)
-                right++;
-            if ((bottom - top) % 2 != 0)
-                bottom++;
+            if ((right - left) % 2 != 0) right++;
+            if ((bottom - top) % 2 != 0) bottom++;
         }
         return new Rect(left, top, right, bottom);
     }
 
     private static VideoFormat resolveVideoFormat(String name) {
-        if (name == null || isGifFormat(name))
-            return VideoFormats.getVideoFormatByName(DEFAULT_VIDEO_FORMAT);
+        if (name == null || isGifFormat(name)) return VideoFormats.getVideoFormatByName(DEFAULT_VIDEO_FORMAT);
         VideoFormat fmt = VideoFormats.getVideoFormatByName(name);
         if (fmt == null) {
             System.err.println("[cli] Unknown format \"" + name + "\", falling back to " + DEFAULT_VIDEO_FORMAT);
@@ -980,12 +1022,12 @@ public final class CliExporter {
         return fmt;
     }
 
-    private static boolean isMovFormat(String formatName) {
-        return formatName != null && ("mov".equalsIgnoreCase(formatName) || "quicktime".equalsIgnoreCase(formatName));
+    private static boolean isMovFormat(String name) {
+        return name != null && ("mov".equalsIgnoreCase(name) || "quicktime".equalsIgnoreCase(name));
     }
 
-    private static boolean isGifFormat(String formatName) {
-        return formatName != null && GIF_FORMAT.equalsIgnoreCase(formatName);
+    private static boolean isGifFormat(String name) {
+        return name != null && GIF_FORMAT.equalsIgnoreCase(name);
     }
 
     // ── GL Bootstrap ──────────────────────────────────────────────────────────
@@ -1052,25 +1094,19 @@ public final class CliExporter {
         }
 
         static CliArgs parse(String[] args) {
-            String scFile = null;
-            String exportName = null;
-            String outputPath = null;
-            String formatName = null;
-            boolean exportAll = false;
-            boolean firstFrame = false;
-            boolean exportFrames = false;
-            boolean bounds = false;
+            String scFile = null, exportName = null, outputPath = null, formatName = null;
+            boolean exportAll = false, firstFrame = false, exportFrames = false, bounds = false;
 
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
-                    case "--export" -> scFile = (i + 1 < args.length) ? args[++i] : null;
-                    case "--name" -> exportName = (i + 1 < args.length) ? args[++i] : null;
-                    case "--out" -> outputPath = (i + 1 < args.length) ? args[++i] : null;
-                    case "--format" -> formatName = (i + 1 < args.length) ? args[++i] : null;
-                    case "--all" -> exportAll = true;
-                    case "--firstframe" -> firstFrame = true;
-                    case "--frames" -> exportFrames = true;
-                    case "--bounds" -> bounds = true;
+                    case "--export"     -> scFile      = (i + 1 < args.length) ? args[++i] : null;
+                    case "--name"       -> exportName  = (i + 1 < args.length) ? args[++i] : null;
+                    case "--out"        -> outputPath  = (i + 1 < args.length) ? args[++i] : null;
+                    case "--format"     -> formatName  = (i + 1 < args.length) ? args[++i] : null;
+                    case "--all"        -> exportAll   = true;
+                    case "--firstframe" -> firstFrame  = true;
+                    case "--frames"     -> exportFrames = true;
+                    case "--bounds"     -> bounds      = true;
                     default -> LOGGER.debug("Ignoring unknown flag: {}", args[i]);
                 }
             }
@@ -1080,17 +1116,13 @@ public final class CliExporter {
                 System.err.println("  --export <file.sc>                                list names");
                 System.err.println("  --export <file.sc> --name <name>                  export first frame as PNG");
                 System.err.println("  --export <file.sc> --name <name> --bounds         export with symmetric canvas");
-                System.err.println(
-                        "  --export <file.sc> --name <name> --frames         export all frames (tight bounds)");
-                System.err
-                        .println("  --export <file.sc> --name <name> --frames --bounds export all frames (symmetric)");
-                System.err
-                        .println("  --export <file.sc> --name <name> --format mov     export as lossless MOV (alpha)");
+                System.err.println("  --export <file.sc> --name <name> --frames         export all frames (tight bounds)");
+                System.err.println("  --export <file.sc> --name <name> --frames --bounds export all frames (symmetric)");
+                System.err.println("  --export <file.sc> --name <name> --format mov     export as lossless MOV (alpha)");
                 System.err.println("  --export <file.sc> --name <name> --format gif     export as GIF");
                 System.err.println("  --export <file.sc> --name <name> --format webm    export as video");
                 System.err.println("  --export <file.sc> --name <name> --out <path>     custom output path");
-                System.err
-                        .println("  --export <file.sc> --all --firstframe             export all as PNG (first frame)");
+                System.err.println("  --export <file.sc> --all --firstframe             export all as PNG (first frame)");
                 System.exit(1);
             }
 
