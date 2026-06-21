@@ -126,6 +126,8 @@ public final class CliExporter {
 
             if (parsed.exportAll) {
                 exportAll(assetFile, swf, parsed);
+            } else if (parsed.exportFrames) {
+                exportFrames(assetFile, swf, parsed);
             } else {
                 exportNamed(assetFile, swf, parsed);
             }
@@ -228,16 +230,203 @@ public final class CliExporter {
                 continue;
             }
 
-            Path outputPath = outDir.resolve(name + ".png");
+            // Check if animated BEFORE deciding export format
+            boolean isAnimated = displayObject.isMovieClip()
+                    && ((MovieClip) displayObject).getFrameCountRecursive() > 1;
+
             EditorStage stage = EditorStage.getInstance();
 
-            // --firstframe: always export frame 0 as PNG regardless of frame count
-            exportFirstFrame(displayObject, outputPath, stage);
-            System.out.println("[cli]   " + name + ".png");
+            // Export based on format
+            if (parsed.firstFrame) {
+                // --firstframe: always export frame 0 as PNG regardless of frame count
+                Path outputPath = outDir.resolve(name + ".png");
+                exportFirstFrame(displayObject, outputPath, stage);
+                System.out.println("[cli]   " + name + ".png");
+            } else if (GIF_FORMAT.equalsIgnoreCase(parsed.formatName) && isAnimated) {
+                // Export as GIF for animated assets
+                Path gifOutputPath = outDir.resolve(name + ".gif");
+                exportGif((MovieClip) displayObject, gifOutputPath, stage);
+                System.out.println("[cli]   " + name + ".gif");
+            } else {
+                // Default: export first frame as PNG
+                Path outputPath = outDir.resolve(name + ".png");
+                exportFirstFrame(displayObject, outputPath, stage);
+                System.out.println("[cli]   " + name + ".png");
+            }
             ok++;
         }
 
         System.out.println("[cli] Done. Exported: " + ok + "  skipped: " + skipped);
+    }
+
+    // ── --frames export mode ──────────────────────────────────────────────────
+    // Export all frames of a named asset directly to a directory with no encoding.
+    // Each frame is saved as frame_0.png, frame_1.png, etc.
+    //
+    private static void exportFrames(SupercellSWFAssetFile assetFile,
+            SupercellSWF swf, CliArgs parsed) {
+        // Resolve export name → object ID
+        int targetId = -1;
+        for (int id : swf.getMovieClipIds()) {
+            try {
+                MovieClipOriginal mc = swf.getOriginalMovieClip(id & 0xFFFF, null);
+                if (parsed.exportName.equals(mc.getExportName())) {
+                    targetId = id & 0xFFFF;
+                    break;
+                }
+            } catch (UnableToFindObjectException e) {
+                LOGGER.warn("Could not check MovieClip id={}", id, e);
+            }
+        }
+
+        if (targetId == -1) {
+            System.err.println("[cli] Export name not found: \"" + parsed.exportName + "\"");
+            System.err.println("[cli] Run without --name to list available names.");
+            System.exit(3);
+            return;
+        }
+
+        DisplayObject displayObject;
+        try {
+            displayObject = assetFile.getOrCreate(targetId, parsed.exportName);
+        } catch (UnableToFindObjectException e) {
+            System.err.println("[cli] Could not instantiate display object: " + e.getMessage());
+            LOGGER.error("DisplayObject creation failure", e);
+            System.exit(4);
+            return;
+        }
+
+        if (displayObject.isTextField()) {
+            System.err.println("[cli] TextField assets cannot be exported.");
+            System.exit(5);
+            return;
+        }
+
+        if (!displayObject.isMovieClip()) {
+            System.err.println("[cli] --frames requires an animated asset (MovieClip).");
+            System.exit(8);
+            return;
+        }
+
+        MovieClip movieClip = (MovieClip) displayObject;
+
+        // Resolve output directory
+        Path outputDir;
+        try {
+            if (parsed.outputPath != null) {
+                outputDir = Path.of(parsed.outputPath);
+            } else {
+                outputDir = DEFAULT_OUTPUT_DIR.resolve(parsed.exportName + "_frames");
+            }
+            Files.createDirectories(outputDir);
+        } catch (IOException e) {
+            System.err.println("[cli] Cannot create output directory: " + e.getMessage());
+            System.exit(6);
+            return;
+        }
+
+        EditorStage stage = EditorStage.getInstance();
+        exportFrameSequence(movieClip, outputDir, stage);
+    }
+
+    // ── Frame sequence export helper ──────────────────────────────────────────
+    // Exports all frames of a MovieClip directly as PNG files with no encoding.
+    // Each frame is saved as frame_0.png, frame_1.png, etc.
+    // Uses the exact same bounds calculation and canvas setup as GIF/video export:
+    // - Symmetric canvas centered on world origin (0,0)
+    // - Transparent padding preserves sprite alignment metadata
+    // - All frames aligned to same world coordinates
+    //
+    private static void exportFrameSequence(MovieClip movieClip, Path outputDir,
+            EditorStage stage) {
+        final float pixelSize = 1.0f;
+
+        // ── Step 1: Calculate bounds for ALL frames ────────────────────────────
+        // Get the bounding box that encompasses every frame of the animation.
+        // This ensures all frames fit within the same canvas size.
+        Rect tightBounds = stage.calculateBoundsForAllFrames(movieClip);
+        tightBounds.scale(pixelSize);
+
+        if (!areBoundsValid(tightBounds)) {
+            LOGGER.warn("Empty bounds for {}, using 1x1 fallback", movieClip);
+            tightBounds = new Rect(0, 0, 1, 1);
+        }
+
+        // ── Step 2: Expand to origin-symmetric canvas ─────────────────────────
+        // CRITICAL: Same logic as PNG/GIF export.
+        // This creates a canvas centered at (0,0) with transparent padding around
+        // the geometry. The world origin lands at pixel (width/2, height/2).
+        //
+        // Example: tight bounds = (-10, -5, 80, 60)
+        // maxH = max(|-10|, |80|) = 80 → canvas X: -80..80 (160 px wide)
+        // maxV = max(|-5|, |60|) = 60 → canvas Y: -60..60 (120 px tall)
+        // All frames will render into this same symmetric canvas.
+        float maxH = Math.max(Math.abs(tightBounds.getLeft()), Math.abs(tightBounds.getRight()));
+        float maxV = Math.max(Math.abs(tightBounds.getTop()), Math.abs(tightBounds.getBottom()));
+
+        // ── Step 3: Round to integer pixels (symmetric) ────────────────────────
+        ReadonlyRect fboRect = roundSymmetric(maxH, maxV);
+
+        // ── Step 4: Configure camera + allocate FBO ───────────────────────────
+        // Same setup as PNG/GIF: symmetric canvas means viewport is centered at origin,
+        // and world (0,0) maps to the exact centre of the framebuffer.
+        Framebuffer framebuffer = RendererHelper.prepareStageForRendering(stage, fboRect);
+
+        boolean parentSet = false;
+        if (movieClip.getParent() == null) {
+            movieClip.setParent(stage.getStageSprite());
+            parentSet = true;
+        }
+
+        Matrix2x3 matrix = new Matrix2x3();
+        matrix.scaleMultiply(pixelSize, pixelSize);
+        ColorTransform colorTransform = new ColorTransform();
+
+        MovieClipState state = movieClip.getState();
+        int loopFrame = movieClip.getLoopFrame();
+        int startFrame = movieClip.getCurrentFrame();
+
+        System.out.println("[cli] Exporting frames to: " + outputDir.toAbsolutePath());
+        System.out.println("[cli] Canvas: " + framebuffer.getWidth() + "x" + framebuffer.getHeight()
+                + ", origin at " + framebuffer.getWidth() / 2 + "," + framebuffer.getHeight() / 2);
+
+        // ── Step 5: Render ALL frames directly to PNG files ──────────────────
+        // Each frame goes into the SAME FBO with the SAME camera setup, so all
+        // frames are aligned to the same world coordinates.
+        MovieClipHelper.doForAllFrames(movieClip, (frameIndex) -> {
+            movieClip.gotoAbsoluteTimeRecursive(frameIndex * movieClip.getMsPerFrame());
+            if (loopFrame != -1) {
+                movieClip.setFrame(loopFrame);
+            } else if (state == MovieClipState.STOPPED) {
+                movieClip.setFrame(startFrame);
+            }
+
+            // Queue geometry for this frame
+            movieClip.render(matrix, colorTransform, 0, 0);
+
+            // Flush geometry into FBO
+            stage.renderToFramebuffer(framebuffer);
+
+            // Flush pending GL tasks + GPU sync
+            flushRenderTasks();
+
+            // ── Un-premultiply and save frame ────────────────────────────────
+            int[] pixels = framebuffer.getPixelArray(true);
+            unPremultiplyAlpha(pixels);
+
+            BufferedImage image = ImageUtils.createBufferedImageFromPixels(
+                    framebuffer.getWidth(), framebuffer.getHeight(), pixels, false);
+
+            Path frameFile = outputDir.resolve("frame_" + frameIndex + ".png");
+            ImageUtils.saveImage(frameFile, image);
+            System.out.println("[cli]   frame_" + frameIndex + ".png");
+        });
+
+        if (parentSet)
+            movieClip.setParent(null);
+        framebuffer.delete();
+
+        System.out.println("[cli] Done. Frames saved to: " + outputDir.toAbsolutePath());
     }
 
     // ── Single named export mode ───────────────────────────────────────────────
@@ -904,15 +1093,17 @@ public final class CliExporter {
         final boolean firstFrame; // true when --firstframe is present
         final String formatName; // video/gif format (webm, mp4, hevc, avi, gif) or null for first frame
         final String outputPath;
+        final boolean exportFrames; // true when --frames is present
 
         private CliArgs(String scFile, String exportName,
-                boolean exportAll, boolean firstFrame, String formatName, String outputPath) {
+                boolean exportAll, boolean firstFrame, String formatName, String outputPath, boolean exportFrames) {
             this.scFile = scFile;
             this.exportName = exportName;
             this.exportAll = exportAll;
             this.firstFrame = firstFrame;
             this.formatName = formatName;
             this.outputPath = outputPath;
+            this.exportFrames = exportFrames;
         }
 
         static CliArgs parse(String[] args) {
@@ -922,6 +1113,7 @@ public final class CliExporter {
             String formatName = null;
             boolean exportAll = false;
             boolean firstFrame = false;
+            boolean exportFrames = false;
 
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
@@ -943,6 +1135,7 @@ public final class CliExporter {
                     }
                     case "--all" -> exportAll = true;
                     case "--firstframe" -> firstFrame = true;
+                    case "--frames" -> exportFrames = true;
                     default -> LOGGER.debug("Ignoring unknown flag: {}", args[i]);
                 }
             }
@@ -955,6 +1148,9 @@ public final class CliExporter {
                 System.err.println(
                         "  --export <file.sc> --name <name> --format webm      export as video (webm|mp4|hevc|avi)");
                 System.err.println("  --export <file.sc> --name <name> --format gif       export as animated GIF");
+                System.err.println(
+                        "  --export <file.sc> --name <name> --frames           export all frames as PNG sequence");
+                System.err.println("  --export <file.sc> --name <name> --frames --out <dir> export frames into dir");
                 System.err.println("  --export <file.sc> --name <name> --out <path>       export to specific path");
                 System.err.println(
                         "  --export <file.sc> --all --firstframe                export all as PNG (first frame)");
@@ -962,7 +1158,7 @@ public final class CliExporter {
                 System.exit(1);
             }
 
-            return new CliArgs(scFile, exportName, exportAll, firstFrame, formatName, outputPath);
+            return new CliArgs(scFile, exportName, exportAll, firstFrame, formatName, outputPath, exportFrames);
         }
     }
 }

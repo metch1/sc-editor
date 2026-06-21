@@ -92,7 +92,8 @@ public class EditorWindow extends Window {
             CameraZoom zoom = camera.getZoom();
 
             float pointSize = zoom.getPointSize() + (float) event.getMagnification() * 2;
-            if (pointSize < 0) return;
+            if (pointSize < 0)
+                return;
 
             zoom.setScaleStep(CameraZoom.estimateCurrentScaleStep(pointSize));
             zoom.setPointSize(pointSize);
@@ -119,8 +120,10 @@ public class EditorWindow extends Window {
         this.frame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
         this.frame.setJMenuBar(this.menubar);
 
-        // Fix of canvas resizing issue. Many thanks to https://jvm-gaming.org/t/using-multiple-canvases/20962/12
-        // We need to create a Dimension object for the JPanel minimum size to fix a GLCanvas resize bug.
+        // Fix of canvas resizing issue. Many thanks to
+        // https://jvm-gaming.org/t/using-multiple-canvases/20962/12
+        // We need to create a Dimension object for the JPanel minimum size to fix a
+        // GLCanvas resize bug.
         // The GLCanvas normally won't receive resize events that shrink a JPanel
         // controlled by a JSplitPane.
         this.canvas.setMinimumSize(new Dimension());
@@ -143,7 +146,8 @@ public class EditorWindow extends Window {
                 if (e.file() instanceof NavigableAsset navigableAsset) {
                     NavigationHistory<?> navigationHistory = navigableAsset.getNavigationHistory();
                     navigationHistory.registerNavigationListener((navigationEvent) -> {
-                        SwingThreadUtils.runOnUiThread(() -> this.menubar.getEditMenu().updateNavigationButtons(navigationHistory));
+                        SwingThreadUtils.runOnUiThread(
+                                () -> this.menubar.getEditMenu().updateNavigationButtons(navigationHistory));
                     });
                 }
             });

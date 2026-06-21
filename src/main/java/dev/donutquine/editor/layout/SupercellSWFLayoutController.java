@@ -28,7 +28,8 @@ import dev.donutquine.swf.SupercellSWF;
 import dev.donutquine.swf.exceptions.UnableToFindObjectException;
 import dev.donutquine.swf.movieclips.MovieClipOriginal;
 
-public class SupercellSWFLayoutController implements TextureLayoutController<SupercellSWFAssetFile>, SearchableLayoutController {
+public class SupercellSWFLayoutController
+        implements TextureLayoutController<SupercellSWFAssetFile>, SearchableLayoutController {
     private static final Logger LOGGER = LoggerFactory.getLogger(SupercellSWFLayoutController.class);
 
     public final EditorWindow window;
@@ -45,7 +46,8 @@ public class SupercellSWFLayoutController implements TextureLayoutController<Sup
         this.window = window;
         this.assetFile = assetFile;
 
-        this.objectListPanel = new DisplayObjectListPanel(this, collectObjectTableRows(this.assetFile.asset).toArray(Object[][]::new));
+        this.objectListPanel = new DisplayObjectListPanel(this,
+                collectObjectTableRows(this.assetFile.asset).toArray(Object[][]::new));
         this.currentObjectInfoPanel = new DisplayObjectInfoPanel();
         this.texturesPanel = new TexturesPanel(this);
         this.timelinePanel = new TimelinePanel();
@@ -62,9 +64,11 @@ public class SupercellSWFLayoutController implements TextureLayoutController<Sup
 
         try {
             for (int movieClipId : this.assetFile.asset.getMovieClipIds()) {
-                MovieClipOriginal movieClipOriginal = this.assetFile.asset.getOriginalMovieClip(movieClipId & 0xFFFF, null);
-                if (movieClipOriginal.getChildren().stream().anyMatch(movieClipChild -> movieClipChild.id() == displayObjectId)) {
-                    usagesRows.add(new Object[] {movieClipId, movieClipOriginal.getExportName(), "MovieClip"});
+                MovieClipOriginal movieClipOriginal = this.assetFile.asset.getOriginalMovieClip(movieClipId & 0xFFFF,
+                        null);
+                if (movieClipOriginal.getChildren().stream()
+                        .anyMatch(movieClipChild -> movieClipChild.id() == displayObjectId)) {
+                    usagesRows.add(new Object[] { movieClipId, movieClipOriginal.getExportName(), "MovieClip" });
                 }
             }
         } catch (UnableToFindObjectException e) {
@@ -76,17 +80,19 @@ public class SupercellSWFLayoutController implements TextureLayoutController<Sup
     }
 
     /**
-    * Adds a display object to the Stage and to the object history and updates the info panel.
-    *
-    * @param id display object id to be selected
-    * @param name display object name
-    */
+     * Adds a display object to the Stage and to the object history and updates the
+     * info panel.
+     *
+     * @param id   display object id to be selected
+     * @param name display object name
+     */
     public void selectObject(int id, String name) {
         NavigationHistory<Integer> navigationHistory = this.assetFile.getNavigationHistory();
 
-        // We don't want to add the same object to history multiple times 
-        //  if it is the last object in the navigation history
-        if (navigationHistory.hasPrevious() && navigationHistory.getCurrent() == id) return;
+        // We don't want to add the same object to history multiple times
+        // if it is the last object in the navigation history
+        if (navigationHistory.hasPrevious() && navigationHistory.getCurrent() == id)
+            return;
 
         try {
             // MovieClip modifiers cannot be displayed yet
@@ -117,8 +123,8 @@ public class SupercellSWFLayoutController implements TextureLayoutController<Sup
         tabbedPane.add("Info", this.currentObjectInfoPanel);
         tabbedPane.add("Textures", this.texturesPanel);
 
-        // FIXME: wtf? I am forcing JSplitPane to revalidate its ui with this hack 
-        //  because revalidate and repaint just don't work as intended.
+        // FIXME: wtf? I am forcing JSplitPane to revalidate its ui with this hack
+        // because revalidate and repaint just don't work as intended.
         JSplitPane parent = (JSplitPane) tabbedPane.getParent();
         int dividerLocation = parent.getDividerLocation();
         parent.setLeftComponent(tabbedPane);
@@ -182,10 +188,11 @@ public class SupercellSWFLayoutController implements TextureLayoutController<Sup
     }
 
     /**
-    * Adds a display object to the Stage and to the object history and updates the info panel.
-    *
-    * @param displayObject display object to be selected
-    */
+     * Adds a display object to the Stage and to the object history and updates the
+     * info panel.
+     *
+     * @param displayObject display object to be selected
+     */
     private void selectObject(DisplayObject displayObject) {
         this.objectListPanel.selectObjectById(displayObject.getId());
 
@@ -222,7 +229,7 @@ public class SupercellSWFLayoutController implements TextureLayoutController<Sup
         for (int movieClipId : swf.getMovieClipIds()) {
             try {
                 MovieClipOriginal movieClipOriginal = swf.getOriginalMovieClip(movieClipId & 0xFFFF, null);
-                rowDataList.add(new Object[] {movieClipId, movieClipOriginal.getExportName(), "MovieClip"});
+                rowDataList.add(new Object[] { movieClipId, movieClipOriginal.getExportName(), "MovieClip" });
             } catch (UnableToFindObjectException e) {
                 LOGGER.error(e.getMessage(), e);
             }
@@ -230,11 +237,11 @@ public class SupercellSWFLayoutController implements TextureLayoutController<Sup
         }
 
         for (int shapesId : swf.getShapeIds()) {
-            rowDataList.add(new Object[] {shapesId, null, "Shape"});
+            rowDataList.add(new Object[] { shapesId, null, "Shape" });
         }
 
         for (int textFieldId : swf.getTextFieldIds()) {
-            rowDataList.add(new Object[] {textFieldId, null, "TextField"});
+            rowDataList.add(new Object[] { textFieldId, null, "TextField" });
         }
 
         return rowDataList;

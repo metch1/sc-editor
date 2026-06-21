@@ -32,9 +32,11 @@ public class EditMenu extends JMenu {
         find.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_F, KeyboardUtils.ctrlButton()));
 
         this.previous = new JMenuItem("Previous", KeyEvent.VK_P);
-        this.previous.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_LEFT, KeyboardUtils.ctrlButton() | InputEvent.ALT_DOWN_MASK));
+        this.previous.setAccelerator(
+                KeyStroke.getKeyStroke(KeyEvent.VK_LEFT, KeyboardUtils.ctrlButton() | InputEvent.ALT_DOWN_MASK));
         this.next = new JMenuItem("Next", KeyEvent.VK_N);
-        this.next.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_RIGHT, KeyboardUtils.ctrlButton() | InputEvent.ALT_DOWN_MASK));
+        this.next.setAccelerator(
+                KeyStroke.getKeyStroke(KeyEvent.VK_RIGHT, KeyboardUtils.ctrlButton() | InputEvent.ALT_DOWN_MASK));
 
         find.addActionListener(this::focusFind);
         this.previous.addActionListener(this::previous);
@@ -46,7 +48,8 @@ public class EditMenu extends JMenu {
         JMenuItem undo = new JMenuItem("Undo", KeyEvent.VK_U);
         undo.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_Z, KeyboardUtils.ctrlButton()));
         JMenuItem redo = new JMenuItem("Redo", KeyEvent.VK_R);
-        redo.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_Z, KeyboardUtils.ctrlButton() | InputEvent.SHIFT_DOWN_MASK));
+        redo.setAccelerator(
+                KeyStroke.getKeyStroke(KeyEvent.VK_Z, KeyboardUtils.ctrlButton() | InputEvent.SHIFT_DOWN_MASK));
 
         undo.addActionListener(this::undo);
         redo.addActionListener(this::redo);

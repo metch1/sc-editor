@@ -41,14 +41,14 @@ public class Main {
         //
         // java.awt.headless must be set as a system property *before* the AWT
         // toolkit is first initialised (which happens lazily on the first AWT
-        // call).  Setting it here – before any Swing import is exercised –
+        // call). Setting it here – before any Swing import is exercised –
         // is the correct and sufficient approach.
         if (CliExporter.isCliMode(args)) {
             // Prevent AWT from trying to connect to a display.
             System.setProperty("java.awt.headless", "true");
 
             // The JVM restart logic below adds --add-exports flags that the
-            // GUI also needs, but the CLI path doesn't require them.  Skip
+            // GUI also needs, but the CLI path doesn't require them. Skip
             // the restart to avoid an infinite loop when the required args
             // are intentionally absent in a thin CLI invocation.
             CliExporter.run(args);
@@ -82,8 +82,7 @@ public class Main {
         SystemFileChooser.setStateStore(new SystemFileChooser.StateStore() {
             private static final String KEY_PREFIX = "fileChooser.";
 
-            private final static Preferences state =
-                    Preferences.userRoot().node("sc-editor");
+            private final static Preferences state = Preferences.userRoot().node("sc-editor");
 
             @Override
             public String get(String key, String def) {
@@ -92,8 +91,10 @@ public class Main {
 
             @Override
             public void put(String key, String value) {
-                if (value != null) state.put(KEY_PREFIX + key, value);
-                else state.remove(KEY_PREFIX + key);
+                if (value != null)
+                    state.put(KEY_PREFIX + key, value);
+                else
+                    state.remove(KEY_PREFIX + key);
             }
         });
 
@@ -153,8 +154,7 @@ public class Main {
             if (Desktop.isDesktopSupported()) {
                 Desktop desktop = Desktop.getDesktop();
                 if (desktop.isSupported(Desktop.Action.APP_ABOUT)) {
-                    desktop.setAboutHandler(e ->
-                            AboutDialog.showAboutDialog(window.getFrame()));
+                    desktop.setAboutHandler(e -> AboutDialog.showAboutDialog(window.getFrame()));
                 }
             }
         } catch (Throwable e) {

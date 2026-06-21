@@ -25,7 +25,8 @@ import dev.donutquine.swf.shapes.ShapeOriginal;
 import dev.donutquine.swf.textures.SWFTexture;
 import team.nulls.ntengine.assets.KhronosTexture;
 
-public class SupercellSWFAssetFile extends TextureAssetFile<SupercellSWF> implements NavigableAsset<Integer, DisplayObject>, SavableAsset {
+public class SupercellSWFAssetFile extends TextureAssetFile<SupercellSWF>
+        implements NavigableAsset<Integer, DisplayObject>, SavableAsset {
     private final Map<Integer, DisplayObject> clonedObjects = new HashMap<>();
 
     private final List<SpriteSheet> spriteSheets = new ArrayList<>();
@@ -85,7 +86,7 @@ public class SupercellSWFAssetFile extends TextureAssetFile<SupercellSWF> implem
     public List<SpriteSheet> getSpriteSheets() {
         return this.spriteSheets;
     }
-    
+
     @Override
     public SpriteSheet getSpriteSheet(int index) {
         return this.spriteSheets.get(index);
@@ -97,12 +98,13 @@ public class SupercellSWFAssetFile extends TextureAssetFile<SupercellSWF> implem
         }
 
         DisplayObjectOriginal displayObjectOriginal = this.asset.getOriginalDisplayObject(id, name);
-        DisplayObject displayObject = DisplayObjectFactory.createFromOriginal(displayObjectOriginal, this.asset, null, this);
+        DisplayObject displayObject = DisplayObjectFactory.createFromOriginal(displayObjectOriginal, this.asset, null,
+                this);
         this.clonedObjects.put(id, displayObject);
 
         return displayObject;
     }
-    
+
     private static List<ShapeDrawBitmapCommand> getDrawBitmapsOfTexture(SupercellSWF swf, int textureIndex) {
         List<ShapeDrawBitmapCommand> bitmapCommands = new ArrayList<>();
 
@@ -136,11 +138,10 @@ public class SupercellSWFAssetFile extends TextureAssetFile<SupercellSWF> implem
         }
 
         return GLImage.createWithFormat(
-            texture.getWidth(), texture.getHeight(), true, 
-            ImageFilter.values()[texture.getInitialTag().getTextureFilter()], 
-            texture.getType().glFormat, texture.getType().glType, 
-            texture.getPixels(), sctxTexture, ktx
-        );
+                texture.getWidth(), texture.getHeight(), true,
+                ImageFilter.values()[texture.getInitialTag().getTextureFilter()],
+                texture.getType().glFormat, texture.getType().glType,
+                texture.getPixels(), sctxTexture, ktx);
     }
 
     @Override
